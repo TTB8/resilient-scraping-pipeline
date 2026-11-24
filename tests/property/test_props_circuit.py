@@ -52,7 +52,7 @@ def test_half_open_allows_at_most_one_probe(
             if state.phase is BreakerPhase.HALF_OPEN:
                 probes_out = 0  # the probe's result has come back
             was_tripped = state.phase is BreakerPhase.TRIPPED
-            state = record(state, rc, now)
+            state = record(state, rc, now, sent_in=generation(state))
             assert not was_tripped or state.phase is BreakerPhase.TRIPPED  # tripped is final
         assert state.open_cycles <= config.max_open_cycles + 1
         assert state.cooldown_s <= config.max_cooldown_s

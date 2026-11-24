@@ -150,14 +150,14 @@ def record(
     response_class: ResponseClass,
     now: float,
     *,
-    sent_in: int | None = None,
+    sent_in: int,
 ) -> BreakerState:
     """Feed the result of a request to this domain into the breaker.
 
-    ``sent_in`` is the :func:`generation` the request was granted in. A result from an older
-    generation is stale (see the module docstring) and only a refusal can still change the state.
-    ``None`` means "granted in the current generation", which is exact only for a caller with at
-    most one request in flight; a concurrent caller must pass it.
+    ``sent_in`` is the :func:`generation` the request was granted in (read it right after
+    :func:`allow` said yes). A result from an older generation is stale (see the module docstring)
+    and only a refusal can still change the state. It is required, with no default: a caller that
+    forgot it would silently get the unsafe behaviour back.
     """
     if state.phase in (BreakerPhase.TRIPPED, BreakerPhase.OPEN):
         return state
@@ -168,7 +168,7 @@ def record(
             open_until=None,
             reason=f"tripped: the site answered {response_class}",
         )
-    if sent_in is not None and sent_in < state.open_cycles:
+    if sent_in < state.open_cycles:
         return state  # sent before the latest opening: not the probe, not news about the present
     if state.phase is BreakerPhase.HALF_OPEN:
         return _record_probe(state, response_class, now)
