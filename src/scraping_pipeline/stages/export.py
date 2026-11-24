@@ -265,12 +265,12 @@ def _domain_stops(store: StateStore, site: Site) -> tuple[DomainStop, ...]:
     )
 
 
-def _requests_of(run: RunRecord) -> int | None:
-    """Requests a fetch run sent, from its summary (None if it never reported a count)."""
+def _requests_of(run: RunRecord, key: str = "requests") -> int | None:
+    """A count from a fetch run's summary (None if it never reported one)."""
     if run.summary_json is None:
         return None
-    requests = json.loads(run.summary_json).get("requests")
-    return requests if isinstance(requests, int) else None
+    value = json.loads(run.summary_json).get(key)
+    return value if isinstance(value, int) else None
 
 
 def _request_counts(
@@ -281,10 +281,16 @@ def _request_counts(
     by_id = {run.run_id: run for run in fetch_runs}
     counts = [_requests_of(by_id[r]) if r in by_id else None for r in fetch_run_ids]
     known = [c for c in counts if c is not None]
+    downgrades = [
+        d
+        for r in fetch_run_ids
+        if r in by_id and (d := _requests_of(by_id[r], "scheme_downgrades")) is not None
+    ]
     return {
         "http_requests": latest,
         "http_requests_total": sum(known) if fetch_run_ids else None,
         "http_requests_unreported_runs": len(counts) - len(known),
+        "scheme_downgrades": sum(downgrades) if fetch_run_ids else None,
     }
 
 

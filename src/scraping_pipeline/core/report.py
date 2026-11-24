@@ -44,6 +44,9 @@ class PageCounts(BaseModel):
     http_requests_unreported_runs: Count = 0
     """How many of those fetch runs recorded no request count (interrupted before reporting): when
     non-zero, ``http_requests_total`` is a lower bound."""
+    scheme_downgrades: Count | None = None
+    """Same-host ``https`` to ``http`` redirect hops followed, summed over the same fetch runs
+    (ADR 0010). Those bodies crossed the network unencrypted; shown only when there were any."""
 
     @property
     def failed(self) -> int:
@@ -194,6 +197,11 @@ def _pages(pages: PageCounts) -> list[str]:
                 "reported no count)"
             )
         lines.append(f"- HTTP requests, all fetch runs behind these pages: {total}")
+    if pages.scheme_downgrades:
+        lines.append(
+            "- Same-host https to http redirect hops followed (ADR 0010): "
+            f"{pages.scheme_downgrades}"
+        )
     if pages.failed_by_class:
         lines += ["", "| Response class | Pages |", "|---|---:|"]
         lines += [

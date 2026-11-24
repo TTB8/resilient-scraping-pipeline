@@ -23,11 +23,17 @@ from scraping_pipeline.fetch.fake import FakeFetcher
 from scraping_pipeline.sites import get_site
 from scraping_pipeline.stages import run_export, run_parse, run_validate
 from scraping_pipeline.stages.common import SitePaths, StageInputError, read_jsonl
-from scraping_pipeline.stages.export import QUARANTINE_COLUMNS, _page_counts, arrow_schema
+from scraping_pipeline.stages.export import (
+    QUARANTINE_COLUMNS,
+    _page_counts,
+    _request_counts,
+    arrow_schema,
+)
 from scraping_pipeline.storage.cache import FetchMeta, PageCache
 from scraping_pipeline.storage.state import (
     DomainEvent,
     DomainEventKind,
+    RunRecord,
     RunStatus,
     Stage,
     StateStore,
@@ -441,3 +447,29 @@ def test_page_counts_leave_out_robots_skips_and_unexplained_stops(tmp_path: Path
         store.record_result("r", stopped, mark_stopped(stopped, "stopped"), None)
         counts = _page_counts(store, Site.QUOTES)
     assert (counts.discovered, counts.fetched, counts.failed_by_class) == (2, 0, {})
+
+
+def test_scheme_downgrades_are_summed_over_the_fetch_runs_behind_the_pages() -> None:
+    """ADR 0010: the report's downgrade count covers the runs whose pages were parsed, only."""
+
+    def run(run_id: str, summary: dict[str, int] | None) -> RunRecord:
+        return RunRecord(
+            run_id=run_id,
+            site=Site.QUOTES,
+            stage=Stage.FETCH,
+            started_at="2026-11-24T00:00:00+00:00",
+            status=RunStatus.SUCCEEDED,
+            settings_json="{}",
+            summary_json=None if summary is None else json.dumps(summary),
+        )
+
+    runs = [
+        run("fetch-a", {"requests": 61, "scheme_downgrades": 50}),
+        run("fetch-b", {"requests": 3, "scheme_downgrades": 2}),
+        run("fetch-c", {"requests": 9, "scheme_downgrades": 7}),  # no parsed page came from it
+        run("fetch-d", None),  # interrupted before reporting
+    ]
+    counts = _request_counts(runs, ("fetch-a", "fetch-b", "fetch-d"))
+    assert counts["scheme_downgrades"] == 52
+    assert counts["http_requests_total"] == 64
+    assert _request_counts(runs, ())["scheme_downgrades"] is None

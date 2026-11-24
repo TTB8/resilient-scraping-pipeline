@@ -248,3 +248,15 @@ def test_deliverables_section_says_when_the_batch_failed_validation() -> None:
     shown = render_markdown(FULL.model_copy(update={"deliverables": delivered}))
     assert "**This batch failed validation.**" in shown
     assert "every other row is in `quarantine.csv`" in shown
+
+
+def test_scheme_downgrades_are_shown_only_when_there_were_any() -> None:
+    """ADR 0010: followed https to http hops are named in the report, silent when zero."""
+    line = "- Same-host https to http redirect hops followed (ADR 0010): 50\n"
+    some = FULL.pages.model_copy(update={"scheme_downgrades": 50})
+    assert line in render_markdown(FULL.model_copy(update={"pages": some}))
+    for none in (0, None):
+        quiet = FULL.pages.model_copy(update={"scheme_downgrades": none})
+        assert "redirect hops followed" not in render_markdown(
+            FULL.model_copy(update={"pages": quiet})
+        )
