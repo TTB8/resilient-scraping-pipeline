@@ -8,8 +8,8 @@ from decimal import Decimal
 from enum import Enum, StrEnum
 from pathlib import Path
 
-import pyarrow as pa  # type: ignore[import-untyped]
-import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from scraping_pipeline.storage.outputs import (

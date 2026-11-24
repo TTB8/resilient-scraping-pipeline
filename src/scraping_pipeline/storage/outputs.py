@@ -34,8 +34,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
-import pyarrow as pa  # type: ignore[import-untyped]
-import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from scraping_pipeline.storage.atomic import atomic_path, atomic_write_text
 

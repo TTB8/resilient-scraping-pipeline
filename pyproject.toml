@@ -47,6 +47,11 @@ python_version = "3.12"
 files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
 
+# pyarrow ships no type stubs. Scoped here instead of `type: ignore` on every import.
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
