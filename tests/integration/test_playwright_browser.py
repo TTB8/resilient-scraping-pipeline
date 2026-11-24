@@ -1,6 +1,6 @@
 """PlaywrightFetcher in a real headless Chromium against the fixture server.
 
-Marked ``browser``: the fast harness check deselects these, CI runs them. They skip (with the launch
+Marked ``browser``: the fast check deselects these, CI runs them. They skip (with the launch
 error as the reason) where Chromium cannot start, unless ``REQUIRE_BROWSER_TESTS=1``.
 """
 

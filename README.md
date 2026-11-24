@@ -226,7 +226,7 @@ redirect, or serve block and challenge pages.
 - **Integration tests** against the fixture server, including a site that starts returning 429s and then a block page: the domain is stopped, the run exits 3, and the report names the reason.
 - **Browser tests** for the JS-rendered site run in CI with Chromium (`playwright install --with-deps chromium`); CI fails rather than skips them if Chromium cannot launch. Locally they skip when Chromium is missing.
 - **Mutation checks.** During development and review, important rules were broken on purpose to check that a test fails. The mutation scripts and their logs are not part of this repository.
-- **Independent review.** A separate reviewer audited the code adversarially, in two rounds. Findings were fixed with regression tests (the reasons are in the commit history and [`harness-lessons.md`](harness-lessons.md)); [ADR 0009](docs/decisions/0009-site-confinement.md) is one result.
+- **Independent review.** A separate reviewer audited the code adversarially, in three rounds. Findings were fixed with regression tests (the reasons are in the commit history); [ADR 0009](docs/decisions/0009-site-confinement.md) is one result.
 
 ## Adapting it to a new site
 

@@ -715,7 +715,7 @@ async def test_same_host_scheme_switch_on_default_ports_is_followed() -> None:
 
 
 async def test_fetcher_that_followed_off_site_is_refused() -> None:
-    # Defence in depth: a fetcher reporting a final_url on another origin (Patrick's repro).
+    # Defence in depth: a fetcher reporting a final_url on another origin (the reviewer's repro).
     page = Respond(200, b"<html>x</html>", final_url="http://169.254.169.254/latest/meta-data/")
     crawl = Crawl({u("/a"): page})
     await crawl.run([u("/a")])

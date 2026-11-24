@@ -85,7 +85,7 @@ async def test_clean_crawl_of_saved_pages(fixture_server: FixtureServer) -> None
 async def test_redirect_chain_stays_on_site(
     make_fixture_server: Callable[..., FixtureServer],
 ) -> None:
-    # Patrick's R1-01 repro, through the scheduler: four same-site hops, then a hop to another
+    # The reviewer's R1-01 repro, through the scheduler: four same-site hops, then a hop to another
     # server. The same-site hops are followed (each with its own token); the off-site one is not.
     site = make_fixture_server("quotes")
     other = make_fixture_server("quotes")

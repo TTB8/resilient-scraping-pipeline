@@ -1,8 +1,1 @@
-# harness-kit:begin
-# Hook scripts must keep LF line endings on Windows checkouts (core.autocrlf
-# would turn `#!/bin/sh` into `#!/bin/sh\r` and break every hook).
-scripts/harness/** text eol=lf
-.githooks/* text eol=lf
-# harness-kit:end
 tests/fixtures/sites/** linguist-vendored -diff
-harness-lessons.md merge=union
