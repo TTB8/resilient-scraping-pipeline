@@ -172,3 +172,8 @@ def test_contract_versions() -> None:
     assert quotes_v1.CONTRACT_VERSION == "quotes/1.0.0"
     assert Book.CONTRACT_VERSION == books_v1.CONTRACT_VERSION
     assert Quote.CONTRACT_VERSION == Author.CONTRACT_VERSION == quotes_v1.CONTRACT_VERSION
+
+
+def test_out_of_stock_is_consistent_and_zero_in_stock_is_not() -> None:
+    assert Book.model_validate({**BOOK, "stock_count": 0, "in_stock": False}).in_stock is False
+    assert rule_of(Book, {**BOOK, "stock_count": 0, "in_stock": True}) == {"in_stock_mismatch"}
