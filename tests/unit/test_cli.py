@@ -104,6 +104,9 @@ def test_run_exits_1_when_validation_fails(
     result = invoke("run", "--site", "quotes")
     assert result.exit_code == 1
     assert "**FAIL**" in result.stdout
+    # The valid rows are still delivered, and the report says in words that the batch failed.
+    assert "**This batch failed validation.**" in result.stdout
+    assert "- `quotes.parquet`" in result.stdout
 
 
 def test_a_stopped_domain_exits_3_and_the_other_stages_still_run(

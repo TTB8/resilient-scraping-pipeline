@@ -33,6 +33,9 @@ class PageCounts(BaseModel):
     fetched: Count
     failed_by_class: dict[ResponseClass, Count] = Field(default_factory=dict)
     """Final failed pages by the response class that ended them (``ok`` never appears here)."""
+    http_requests: Count | None = None
+    """HTTP requests the last fetch run sent, robots.txt and redirect hops included. Pages and
+    requests differ on purpose: the politeness bound is about requests (ADR 0009)."""
 
     @property
     def failed(self) -> int:
@@ -95,6 +98,20 @@ class ValidationSummary(BaseModel):
         )
 
 
+class Deliverables(BaseModel):
+    """The data files export published. They hold only rows that passed the contract.
+
+    ``verdict_failed`` marks a batch whose validation verdict was FAIL: the files are still
+    written (failing rows are in ``quarantine.csv``, never dropped), and the report says so in
+    words, so nobody mistakes a partial batch for a clean one.
+    """
+
+    model_config = _FROZEN
+
+    published: tuple[str, ...] = ()
+    verdict_failed: bool = False
+
+
 class RunReport(BaseModel):
     """Everything one run of one site did. ``parse`` and ``validation`` are ``None`` until those stages run."""
 
@@ -110,6 +127,7 @@ class RunReport(BaseModel):
     domains_stopped: tuple[DomainStop, ...] = ()
     parse: ParseCoverage | None = None
     validation: ValidationSummary | None = None
+    deliverables: Deliverables | None = None
 
 
 def render_markdown(report: RunReport) -> str:
@@ -132,6 +150,7 @@ def render_markdown(report: RunReport) -> str:
         *_parse(report.parse),
         "",
         *_validation(report.validation),
+        *_deliverables(report.deliverables),
     ]
     return "\n".join(lines) + "\n"
 
@@ -144,6 +163,10 @@ def _pages(pages: PageCounts) -> list[str]:
         f"- Fetched: {pages.fetched}",
         f"- Failed: {pages.failed}",
     ]
+    if pages.http_requests is not None:
+        lines.append(
+            f"- HTTP requests (robots.txt and redirect hops included): {pages.http_requests}"
+        )
     if pages.failed_by_class:
         lines += ["", "| Response class | Pages |", "|---|---:|"]
         lines += [
@@ -194,6 +217,23 @@ def _validation(summary: ValidationSummary | None) -> list[str]:
         lines += ["", "| Rule | Failures |", "|---|---:|"]
         lines += [f"| {rule} | {n} |" for rule, n in sorted(summary.rule_counts.items())]
     return lines
+
+
+def _deliverables(deliverables: Deliverables | None) -> list[str]:
+    if deliverables is None:
+        return []
+    lines = ["", "## Deliverables", ""]
+    if deliverables.verdict_failed:
+        lines += [
+            "**This batch failed validation.** The files hold only the rows that passed the "
+            "contract; every other row is in `quarantine.csv` with its reasons.",
+            "",
+        ]
+    return [
+        *lines,
+        *(f"- `{name}`" for name in sorted(deliverables.published)),
+        "- `quarantine.csv`",
+    ]
 
 
 def _cell(text: str) -> str:

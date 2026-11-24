@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from scraping_pipeline.core.report import (
+    Deliverables,
     DomainStop,
     PageCounts,
     ParseCoverage,
@@ -194,3 +195,32 @@ def test_summary_from_validation_report_drops_row_failures() -> None:
     shown = render_markdown(FULL.model_copy(update={"validation": summary}))
     assert "- Verdict: **FAIL**: 1 of 1 rows quarantined, above max rate 0" in shown
     assert "| missing | 1 |" in shown
+
+
+def test_optional_sections_are_absent_unless_set() -> None:
+    # The golden strings above pin that a report without them renders byte-identically.
+    shown = render_markdown(FULL)
+    assert "HTTP requests" not in shown
+    assert "## Deliverables" not in shown
+
+
+def test_http_requests_line_counts_requests_not_pages() -> None:
+    pages = FULL.pages.model_copy(update={"http_requests": 1061})
+    shown = render_markdown(FULL.model_copy(update={"pages": pages}))
+    assert "- HTTP requests (robots.txt and redirect hops included): 1061\n" in shown
+
+
+def test_deliverables_section_lists_files_sorted() -> None:
+    delivered = Deliverables(published=("books.parquet", "books.csv"))
+    shown = render_markdown(FULL.model_copy(update={"deliverables": delivered}))
+    assert shown.endswith(
+        "## Deliverables\n\n- `books.csv`\n- `books.parquet`\n- `quarantine.csv`\n"
+    )
+    assert "failed validation" not in shown
+
+
+def test_deliverables_section_says_when_the_batch_failed_validation() -> None:
+    delivered = Deliverables(published=("books.csv",), verdict_failed=True)
+    shown = render_markdown(FULL.model_copy(update={"deliverables": delivered}))
+    assert "**This batch failed validation.**" in shown
+    assert "every other row is in `quarantine.csv`" in shown

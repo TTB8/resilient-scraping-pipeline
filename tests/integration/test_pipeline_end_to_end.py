@@ -93,6 +93,12 @@ def test_books_end_to_end(
     assert report["pages"]["fetched"] == 8
     assert set(report["pages"]["failed_by_class"]) == {"not_found"}
     assert report["domains_stopped"] == []
+    # Requests are what the politeness bound counts: every page plus robots.txt (no redirects here).
+    assert report["pages"]["http_requests"] == sum(server.hit_counts().values())
+    assert report["deliverables"] == {
+        "published": ["books.parquet", "books.csv"],
+        "verdict_failed": False,
+    }
     assert result.stdout == (out / "run_report.md").read_text()
     assert max(server.hit_counts().values()) == 1  # every URL asked for once
 

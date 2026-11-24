@@ -17,6 +17,13 @@ Deliverables, under ``<data_dir>/output/<site>/``:
 * ``quarantine.csv``: one line per failure of every quarantined row;
 * ``run_report.json`` and ``run_report.md`` (``core.report``).
 
+**A FAIL verdict still publishes the valid rows** (ADR 0004: report failures, never drop them):
+the tables hold only rows that passed the contract, ``quarantine.csv`` holds every other row with
+its reasons, the report's *Deliverables* section says plainly that the batch failed validation, and
+the stage exits 1 so a scheduler does not treat it as a clean delivery. Withholding the files
+instead would make every partial crawl (``--max-pages``, a stopped domain) deliver nothing, since
+referential checks then fail by construction.
+
 **Determinism.** Every data file is byte-identical across re-runs on the same cache
 (``storage.outputs`` pins the writer settings; rows are sorted by the site's sort key). The run
 report is the exception, on purpose: it says *when* the pipeline ran (``started_at``,
@@ -31,6 +38,7 @@ class that stopped its domain, when known. Domains stopped are those with ``stop
 
 from __future__ import annotations
 
+import json
 import types
 import typing
 from dataclasses import dataclass
@@ -43,6 +51,7 @@ from pydantic import BaseModel, ValidationError
 
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.report import (
+    Deliverables,
     DomainStop,
     PageCounts,
     ParseCoverage,
@@ -65,7 +74,13 @@ from scraping_pipeline.stages.common import (
 )
 from scraping_pipeline.storage.atomic import atomic_write_text
 from scraping_pipeline.storage.outputs import write_csv, write_parquet
-from scraping_pipeline.storage.state import DomainEventKind, RunStatus, Stage, StateStore
+from scraping_pipeline.storage.state import (
+    DomainEventKind,
+    RunRecord,
+    RunStatus,
+    Stage,
+    StateStore,
+)
 
 #: Precision of exported decimals; the scale comes from the contract (``decimal_places``).
 DECIMAL_PRECISION = 18
@@ -214,6 +229,14 @@ def _domain_stops(store: StateStore, site: Site) -> tuple[DomainStop, ...]:
     )
 
 
+def _last_fetch_requests(fetch_runs: list[RunRecord]) -> int | None:
+    """Requests sent by the most recent fetch run, from its summary (None if it never reported)."""
+    if not fetch_runs or fetch_runs[-1].summary_json is None:
+        return None
+    requests = json.loads(fetch_runs[-1].summary_json).get("requests")
+    return requests if isinstance(requests, int) else None
+
+
 def _build_report(
     store: StateStore,
     spec: SiteSpec,
@@ -234,7 +257,9 @@ def _build_report(
         started_at=started_at,
         finished_at=finished.isoformat(),
         duration_s=duration,
-        pages=_page_counts(store, site),
+        pages=_page_counts(store, site).model_copy(
+            update={"http_requests": _last_fetch_requests(fetch_runs)}
+        ),
         domains_stopped=_domain_stops(store, site),
         parse=ParseCoverage(
             item_pages_fetched=stats["item_pages_fetched"],
@@ -260,6 +285,7 @@ def run_export(settings: Settings, site: Site, *, started_at: str | None = None)
         stats = read_json(paths.parse_stats)
         validation = ValidationReport.model_validate(read_json(paths.validation_report))
         rows_by_table: dict[str, int] = {}
+        published: list[str] = []
         for table in spec.tables:
             rows = _load_table(paths, table, stats["parse_run_id"])
             schema = arrow_schema(table.model)
@@ -276,13 +302,20 @@ def run_export(settings: Settings, site: Site, *, started_at: str | None = None)
                 paths.output / f"{table.name}.csv", rows, schema.names, sort_key=table.sort_key
             )
             rows_by_table[table.name] = len(rows)
+            published += [f"{table.name}.parquet", f"{table.name}.csv"]
         write_csv(
             paths.output / "quarantine.csv",
             _quarantine_rows(paths),
             QUARANTINE_COLUMNS,
             sort_key=("row", "failure"),
         )
-        report = _build_report(store, spec, stats, validation, started_at)
+        report = _build_report(store, spec, stats, validation, started_at).model_copy(
+            update={
+                "deliverables": Deliverables(
+                    published=tuple(published), verdict_failed=validation.verdict is Verdict.FAIL
+                )
+            }
+        )
         markdown = render_markdown(report)
         atomic_write_text(paths.output / "run_report.json", report.model_dump_json(indent=2) + "\n")
         atomic_write_text(paths.output / "run_report.md", markdown)
