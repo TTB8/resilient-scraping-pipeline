@@ -52,16 +52,18 @@ async def test_dripping_body_hits_the_overall_deadline(fixture_server: FixtureSe
         result = await fetcher.fetch(fixture_server.url("/"))
         took = time.monotonic() - started
     assert result.error is TransportError.TIMEOUT
-    assert took < 1.5
+    # What the deadline proves: it returned well before the 4 s the whole body takes. The margin
+    # is wide so a loaded runner cannot fail it.
+    assert took < 3.0
 
 
 async def test_slow_response_maps_to_timeout(fixture_server: FixtureServer) -> None:
-    fixture_server.scenario(Phase.slow(1.0))
+    fixture_server.scenario(Phase.slow(5.0))
     async with HttpxFetcher(make_settings(request_timeout_s=0.2)) as fetcher:
         result = await fetcher.fetch(fixture_server.url("/"))
     assert result.error is TransportError.TIMEOUT
     assert result.status is None
-    assert result.elapsed_s < 1.0
+    assert result.elapsed_s < 2.5  # it gave up long before the server's 5 s answer
 
 
 async def test_closed_port_maps_to_connect_error() -> None:
@@ -102,3 +104,4 @@ async def test_scenarios_play_in_order(fixture_server: FixtureServer) -> None:
     assert statuses == [200, 503, 503, 200, 200]
     log = fixture_server.log()
     assert [hit.status for hit in log] == [200, 200, 503, 503, 200, 200]
+

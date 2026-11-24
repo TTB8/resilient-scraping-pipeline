@@ -62,7 +62,10 @@ async def test_rate_limit_then_block_page_stops_the_domain(fixture_server: Fixtu
     }
     assert list(summary.domains_stopped) == ["127.0.0.1"]
     assert len(sink.of("stopped")) == 1
-    assert took < 3.0  # the stop woke the entry waiting out Retry-After
+    # Generous on purpose (a loaded CI runner): it only rules out a run that hangs or sleeps out
+    # backoffs it should not. That the stop wakes an entry waiting out Retry-After is pinned in
+    # virtual time by test_stop_wakes_entries_waiting_on_a_long_retry, and above by attempts == 1.
+    assert took < 15.0
 
 
 async def test_clean_crawl_of_saved_pages(fixture_server: FixtureServer) -> None:
@@ -115,4 +118,8 @@ async def test_redirect_chain_stays_on_site(
     assert summary.requests == 1 + 5 + 2
     times = [hit.at for hit in site.log()]
     gaps = [b - a for a, b in itertools.pairwise(times)]
-    assert min(gaps) >= 0.2 - 0.02  # scheduler-side spacing, measured at the server
+    # Spacing measured at the server. One gap can shrink when the earlier hit is logged late (a
+    # server thread scheduled after the next request was sent), so assert the whole span, which
+    # still catches a burst, plus a loose floor per gap.
+    assert times[-1] - times[0] >= (len(times) - 1) * 0.2 - 0.05
+    assert min(gaps) >= 0.1

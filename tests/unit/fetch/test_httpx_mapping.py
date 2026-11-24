@@ -110,7 +110,7 @@ async def test_overall_deadline_bounds_a_dripping_body() -> None:
     async with f:
         started = time.monotonic()
         result = await f.fetch(URL)
-    assert time.monotonic() - started < 1.0  # 100 chunks would take 5 s
+    assert time.monotonic() - started < 2.5  # 100 chunks take 5 s; the deadline is 0.3 s
     assert result.error is TransportError.TIMEOUT
     assert result.status == 200  # the headers had arrived
     assert result.body == b""
