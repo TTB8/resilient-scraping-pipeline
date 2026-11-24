@@ -16,12 +16,17 @@ make every parse produce different bytes, which contradicts determinism.
   and under any hash seed.
 - The run id written on each record is **derived from its inputs**:
   `parse_run_id = sha256(manifest of that site's cache entries, parser version, contract version)`,
-  truncated to 16 hex characters. The same inputs give the same id and the same bytes. A changed
+  truncated to 16 hex characters. The manifest hashes one `(url, content_sha256, fetch_run_id)`
+  triple per page, so the same bytes fetched by another crawl give another id: the
+  `fetch_run_id` is on every row, so it is part of what decides the output bytes. The same inputs give the same id and the same bytes. A changed
   page, parser or contract gives a new id. The id still answers the lineage question ("which inputs
   and which code produced this row?"), and each row also carries the `fetch_run_id` and the
   content hash of the page it came from.
-- Everything that varies by nature (start and finish times, durations, the fetch run's own random
-  id) lives in the **run report**, which is explicitly outside the determinism guarantee.
+- Everything that varies by nature (start and finish times, durations) lives in the **run
+  report**, which is explicitly outside the determinism guarantee. A fetch run's id is random when
+  it is created, but once a page is cached its `fetch_run_id` is a fact of the cache: it is on
+  every row, in the parse manifest and in `parse_stats.json`, and re-running the offline stages
+  reproduces it exactly. Only the report's "latest fetch run" line can name a run no row carries.
 - The writers remove each source of drift explicitly: rows are sorted by a unique key before
   writing (ties are an error, not an accident); Parquet writer settings are pinned (compression,
   format version, page version, dictionary, statistics, row-group size); CSV has a fixed column

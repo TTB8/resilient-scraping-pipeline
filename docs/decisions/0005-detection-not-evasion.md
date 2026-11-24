@@ -28,8 +28,8 @@ the site changes the rules every week.
   the run report names it. Other domains carry on.
 - **Never evade.** The project contains no stealth plugins, proxy rotation, captcha solving,
   fingerprint spoofing or User-Agent impersonation. The fetchers ignore proxy environment
-  variables. The settings refuse a User-Agent that borrows a browser's or another crawler's
-  identity. The repository's agent guard blocks adding such packages. A `stopped` domain can be
+  variables. The settings refuse a User-Agent that carries a well-known browser or crawler
+  identity (a denylist of product tokens; an unknown crawler's name is not detected). The repository's agent guard blocks adding such packages. A `stopped` domain can be
   re-queued later (`fetch --retry-failed`), which is a human decision to try again politely, not
   a way around the block.
 
