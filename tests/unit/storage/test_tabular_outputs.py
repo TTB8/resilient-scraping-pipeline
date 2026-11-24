@@ -159,16 +159,56 @@ def test_bad_sort_keys_raise(tmp_path: Path, sort_key: list[str], message: str) 
         write_csv(tmp_path / "x.csv", data, COLUMNS, sort_key=sort_key)
 
 
-def test_none_sorts_first_and_composite_keys_work(tmp_path: Path) -> None:
+def test_composite_keys_sort_column_by_column(tmp_path: Path) -> None:
     path = tmp_path / "x.csv"
     data: list[dict[str, object]] = [
         {"k": 2, "j": "b"},
-        {"k": None, "j": "z"},
+        {"k": 0, "j": "z"},
         {"k": 2, "j": "a"},
         {"k": 1, "j": "q"},
     ]
     write_csv(path, data, ["k", "j"], sort_key=["k", "j"])
-    assert path.read_text() == "k,j\n,z\n1,q\n2,a\n2,b\n"
+    assert path.read_text() == "k,j\n0,z\n1,q\n2,a\n2,b\n"
+
+
+@pytest.mark.parametrize("missing", [None, float("nan"), Decimal("NaN"), Decimal("sNaN")], ids=repr)
+def test_none_and_nan_in_a_key_column_are_rejected(tmp_path: Path, missing: object) -> None:
+    # NaN != NaN: two NaN keys would pass the uniqueness check and land in input order.
+    data: list[dict[str, object]] = [
+        {"k": 1.0, "j": "a"},
+        {"k": missing, "j": "b"},
+        {"k": missing, "j": "c"},
+    ]
+    with pytest.raises(SchemaMismatchError, match="sort_key column 'k'"):
+        write_csv(tmp_path / "x.csv", data, ["k", "j"], sort_key=["k"])
+    assert not (tmp_path / "x.csv").exists()
+
+
+def test_nan_in_a_key_column_is_rejected_for_parquet(tmp_path: Path) -> None:
+    schema = pa.schema([pa.field("k", pa.float64()), pa.field("j", pa.string())])
+    data: list[dict[str, object]] = [{"k": float("nan"), "j": "a"}, {"k": 1.0, "j": "b"}]
+    with pytest.raises(SchemaMismatchError, match="sort_key column 'k'"):
+        write_parquet(tmp_path / "x.parquet", data, schema, sort_key=["k"])
+
+
+def test_none_and_nan_outside_the_key_are_still_written(tmp_path: Path) -> None:
+    path = tmp_path / "x.csv"
+    data: list[dict[str, object]] = [{"k": 1, "v": float("nan")}, {"k": 2, "v": None}]
+    write_csv(path, data, ["k", "v"], sort_key=["k"])
+    assert path.read_text() == "k,v\n1,nan\n2,\n"
+
+
+def test_csv_keeps_formula_like_text_byte_faithful(tmp_path: Path) -> None:
+    """Documented decision: no apostrophe prefix; the CSV is data interchange, not a spreadsheet."""
+    path = tmp_path / "x.csv"
+    data: list[dict[str, object]] = [
+        {"k": 1, "v": "=HYPERLINK(1)"},
+        {"k": 2, "v": "+1"},
+        {"k": 3, "v": "-x"},
+        {"k": 4, "v": "@sum"},
+    ]
+    write_csv(path, data, ["k", "v"], sort_key=["k"])
+    assert path.read_text() == "k,v\n1,=HYPERLINK(1)\n2,+1\n3,-x\n4,@sum\n"
 
 
 def test_incomparable_sort_values_raise(tmp_path: Path) -> None:
