@@ -71,8 +71,11 @@ class BackoffPolicy:
             raise ValueError(f"cap_s ({self.cap_s!r}) must be >= base_s ({self.base_s!r})")
         if self.max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts!r}")
-        if self.max_retry_after_s < 0:
-            raise ValueError(f"max_retry_after_s must be >= 0, got {self.max_retry_after_s!r}")
+        if not 0 <= self.max_retry_after_s < RETRY_AFTER_CEILING_S:
+            raise ValueError(
+                f"max_retry_after_s must be >= 0 and < {RETRY_AFTER_CEILING_S:g}, "
+                f"got {self.max_retry_after_s!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,16 +91,32 @@ _PERMANENT = frozenset({ResponseClass.NOT_FOUND, ResponseClass.CLIENT_ERROR})
 _REFUSED = frozenset({ResponseClass.BLOCKED, ResponseClass.CHALLENGE})
 
 
+RETRY_AFTER_CEILING_S = 1e10
+"""What a delta-seconds ``Retry-After`` longer than ten digits parses to (about 317 years).
+
+A header value can be arbitrarily long, and ``float(int("9" * 400))`` raises ``OverflowError``
+(``int("9" * 5000)`` raises ``ValueError``), which would escape the classifier and abort the run.
+Ten digits already mean "centuries", so anything longer is read as what the server is saying: go
+away for a very long time. The ceiling is finite (safe to store and print) and larger than any
+allowed :attr:`BackoffPolicy.max_retry_after_s`, so :func:`decide` always stops the domain for it.
+"""
+
+_MAX_DELTA_DIGITS = 10
+
+
 def parse_delta_seconds(value: str | None) -> float | None:
     """Parse the delta-seconds form of ``Retry-After`` (RFC 9110 section 10.2.3: ``1*DIGIT``).
 
-    Only non-negative integers are valid; signs, fractions and anything else return ``None``.
+    Only non-negative integers are valid; signs, fractions and anything else return ``None``. More
+    than ten digits gives :data:`RETRY_AFTER_CEILING_S`. Never raises, whatever the input.
     """
     if value is None:
         return None
     text = value.strip()
     if not text.isascii() or not text.isdigit():
         return None
+    if len(text) > _MAX_DELTA_DIGITS:
+        return RETRY_AFTER_CEILING_S
     return float(int(text))
 
 
@@ -114,11 +133,11 @@ def parse_http_date(value: str | None) -> float | None:
         return None
     try:
         moment = parsedate_to_datetime(text)
-    except (TypeError, ValueError, IndexError):
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.timestamp()
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return moment.timestamp()
 
 
 def parse_retry_after(value: str | None, now_epoch: float) -> float | None:
