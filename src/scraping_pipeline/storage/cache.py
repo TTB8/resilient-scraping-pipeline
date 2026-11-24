@@ -42,7 +42,7 @@ import io
 import json
 import re
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +66,7 @@ HEADER_ALLOWLIST: frozenset[str] = frozenset(
 GZIP_LEVEL = 9
 
 _MANIFEST_VERSION = b"page-cache-manifest/v1\n"
+_LINEAGE_MANIFEST_VERSION = b"page-cache-manifest/v1+fetch-run-id\n"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_NAME = re.compile(r"^[0-9a-f]{64}\.gz$")
 _ENTRY_NAME = re.compile(r"^[0-9a-f]{64}\.json$")
@@ -247,16 +248,40 @@ class PageCache:
         entries = [entry for _, entry in self._walk_entries() if entry is not None]
         return iter(sorted(entries, key=lambda entry: entry.url))
 
-    def manifest_sha256(self) -> str:
+    def manifest_sha256(
+        self, urls: Iterable[str] | None = None, *, with_fetch_run_ids: bool = False
+    ) -> str:
         """sha256 over the sorted ``(url, content_sha256)`` pairs of all valid entries.
 
         Each pair is encoded as a JSON array on its own line after a version header, so the
         encoding is unambiguous whatever characters a URL contains.
+
+        ``urls`` restricts the manifest to those URLs' valid entries (URLs without one are simply
+        absent), so one site's parse run id does not change when another site's pages are fetched
+        into the same cache. The encoding is the same either way: the manifest of a subset equals
+        the full manifest of a cache that holds only that subset. Order and repeats in ``urls`` do
+        not matter.
+
+        ``with_fetch_run_ids=True`` hashes ``(url, content_sha256, fetch_run_id)`` triples under a
+        different version header instead. That is the identity the parse stage needs: every row it
+        writes carries the ``fetch_run_id`` of its page, so two caches with the same bodies from
+        different fetch runs produce different bytes and must not share a parse run id. The
+        default (content only) is unchanged.
         """
-        digest = hashlib.sha256(_MANIFEST_VERSION)
-        pairs = sorted((entry.url, entry.content_sha256) for entry in self.iter_entries())
-        for url, content_sha256 in pairs:
-            line = json.dumps([url, content_sha256], ensure_ascii=True, separators=(",", ":"))
+        if with_fetch_run_ids:
+            digest = hashlib.sha256(_LINEAGE_MANIFEST_VERSION)
+        else:
+            digest = hashlib.sha256(_MANIFEST_VERSION)
+        if urls is None:
+            selected: Iterable[CacheEntry] = self.iter_entries()
+        else:
+            selected = (e for url in set(urls) if (e := self.get_entry(url)) is not None)
+        rows = sorted(
+            [entry.url, entry.content_sha256, *([entry.fetch_run_id] if with_fetch_run_ids else [])]
+            for entry in selected
+        )
+        for row in rows:
+            line = json.dumps(row, ensure_ascii=True, separators=(",", ":"))
             digest.update(line.encode("ascii") + b"\n")
         return digest.hexdigest()
 

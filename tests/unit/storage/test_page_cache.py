@@ -421,3 +421,50 @@ def test_scan_can_verify_object_integrity(cache: PageCache) -> None:
 def test_scan_of_a_missing_cache_is_empty(cache: PageCache) -> None:
     scan = cache.scan()
     assert (scan.entries, scan.objects, scan.healthy) == (0, 0, True)
+
+
+def test_manifest_url_filter_covers_only_named_entries(cache: PageCache, tmp_path: Path) -> None:
+    cache.put(URL_A, BODY, meta())
+    cache.put(URL_B, b"b", meta())
+    full = cache.manifest_sha256()
+    # Naming every URL (in any order, with repeats) is the full manifest, byte for byte.
+    assert cache.manifest_sha256([URL_B, URL_A, URL_A]) == full
+    # A subset hashes like a cache that holds only that subset.
+    only_a = PageCache(tmp_path / "only-a")
+    only_a.put(URL_A, BODY, meta())
+    assert cache.manifest_sha256([URL_A]) == only_a.manifest_sha256()
+    assert cache.manifest_sha256([URL_A]) != full
+    # URLs without an entry are absent, not an error; no URLs is the empty manifest.
+    assert cache.manifest_sha256([URL_A, "https://books.toscrape.com/missing"]) == (
+        only_a.manifest_sha256()
+    )
+    assert cache.manifest_sha256([]) == PageCache(tmp_path / "empty").manifest_sha256()
+
+
+def test_manifest_url_filter_skips_damaged_entries(cache: PageCache) -> None:
+    cache.put(URL_A, BODY, meta())
+    cache.put(URL_B, b"b", meta())
+    entry_path(cache, URL_B).write_bytes(b"{not json")
+    assert cache.manifest_sha256([URL_A, URL_B]) == cache.manifest_sha256()
+
+
+def test_lineage_manifest_also_covers_fetch_run_ids(cache: PageCache, tmp_path: Path) -> None:
+    cache.put(URL_A, BODY, meta(fetch_run_id="run-1"))
+    other = PageCache(tmp_path / "other")
+    other.put(URL_A, BODY, meta(fetch_run_id="run-2"))
+    # Content-only: identical. With fetch run ids: they differ, because parse output does.
+    assert cache.manifest_sha256() == other.manifest_sha256()
+    assert cache.manifest_sha256(with_fetch_run_ids=True) != other.manifest_sha256(
+        with_fetch_run_ids=True
+    )
+    same = PageCache(tmp_path / "same")
+    same.put(URL_A, BODY, meta(fetch_run_id="run-1", fetched_at="2020-01-01T00:00:00Z"))
+    assert same.manifest_sha256([URL_A], with_fetch_run_ids=True) == cache.manifest_sha256(
+        with_fetch_run_ids=True
+    )
+    expected = hashlib.sha256(
+        b"page-cache-manifest/v1+fetch-run-id\n"
+        + json.dumps([URL_A, sha(BODY), "run-1"], separators=(",", ":")).encode()
+        + b"\n"
+    ).hexdigest()
+    assert cache.manifest_sha256(with_fetch_run_ids=True) == expected

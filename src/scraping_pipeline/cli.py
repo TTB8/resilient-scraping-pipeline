@@ -1,10 +1,131 @@
-"""Command-line entry point (``pipeline``). The stage commands are added as they are built."""
+"""Command-line entry point (``pipeline``): parse arguments, call a stage, map its result to an exit code.
+
+Every command is a thin shell over a ``stages.run_<stage>`` function, which is where the work and
+the tests are. The CLI builds :class:`~scraping_pipeline.config.Settings` (environment and ``.env``
+first, then the command-line overrides), configures logging (JSON lines to stderr, so stdout stays
+for command output such as the run report), and turns the result into an exit code.
+
+Exit codes are part of the interface, because a scheduler (cron, CI, an orchestrator) reacts to
+them without reading logs:
+
+====  =========================================================================================
+0     everything ran and the data passed validation
+1     validation failed (the files are still written, so the reason can be read)
+2     usage error: a bad option or setting, a stage's input missing (run the previous stage
+      first), or another pipeline process holding the state database
+3     a domain was stopped (blocked, a challenge, rate limited beyond our limits). The other
+      stages still ran on what was fetched; the report says why. Distinct from 1 because the cure
+      differs: wait, look at the site, then ``fetch --retry-failed``; not fix a parser
+130   interrupted (Ctrl-C). Everything completed so far is kept; re-run to resume
+====  =========================================================================================
+
+When several apply to ``pipeline run``, the most actionable wins: 130, then 3 (a stopped domain
+usually explains a failed validation too), then 1.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from enum import IntEnum
+from pathlib import Path
+from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 
 from scraping_pipeline import __version__
+from scraping_pipeline.config import Settings
+from scraping_pipeline.core.types import Site
+from scraping_pipeline.core.urls import domain as domain_of
+from scraping_pipeline.logging import configure_logging
+from scraping_pipeline.stages import (
+    run_discover,
+    run_export,
+    run_fetch,
+    run_parse,
+    run_validate,
+)
+from scraping_pipeline.stages.common import StageInputError, stopped_domains, utc_now_iso
+from scraping_pipeline.stages.fetch import FetchStageResult
+from scraping_pipeline.storage.state import DomainEventKind, StateLockedError, StateStore
 
 app = typer.Typer(help="Polite, resumable web data pipeline.", no_args_is_help=True)
+
+#: How many recent runs ``pipeline status`` lists.
+STATUS_RUNS = 10
+
+
+class ExitCode(IntEnum):
+    OK = 0
+    VALIDATION_FAILED = 1
+    USAGE = 2
+    DOMAIN_STOPPED = 3
+    INTERRUPTED = 130
+
+
+SiteOption = Annotated[Site, typer.Option("--site", help="Which site to run.", show_choices=True)]
+DataDirOption = Annotated[
+    Path | None, typer.Option("--data-dir", help="Cache, state and outputs (PIPELINE_DATA_DIR).")
+]
+MaxPagesOption = Annotated[
+    int | None, typer.Option("--max-pages", help="Frontier size cap per site (PIPELINE_MAX_PAGES).")
+]
+MaxDepthOption = Annotated[
+    int | None,
+    typer.Option("--max-depth", help="Link depth cap from the seeds (PIPELINE_MAX_DEPTH)."),
+]
+
+
+def _fail(message: str, code: ExitCode) -> typer.Exit:
+    typer.echo(f"error: {message}", err=True)
+    return typer.Exit(int(code))
+
+
+def _settings(data_dir: Path | None, max_pages: int | None, max_depth: int | None) -> Settings:
+    overrides: dict[str, Any] = {
+        name: value
+        for name, value in (
+            ("data_dir", data_dir),
+            ("max_pages", max_pages),
+            ("max_depth", max_depth),
+        )
+        if value is not None
+    }
+    try:
+        settings = Settings(**overrides)
+    except ValidationError as exc:
+        raise _fail(f"invalid settings:\n{exc}", ExitCode.USAGE) from None
+    configure_logging(settings.log_level, settings.log_format)
+    return settings
+
+
+@contextmanager
+def _guarded() -> Iterator[None]:
+    """Map the exceptions a user can cause to exit codes; anything else is a bug and propagates."""
+    try:
+        yield
+    except KeyboardInterrupt:
+        raise _fail(
+            "interrupted; progress is saved, re-run to resume", ExitCode.INTERRUPTED
+        ) from None
+    except (StageInputError, StateLockedError) as exc:
+        raise _fail(str(exc), ExitCode.USAGE) from None
+
+
+def _call[T](stage: Callable[[], T]) -> T:
+    with _guarded():
+        return stage()
+
+
+def _fetch_code(result: FetchStageResult) -> ExitCode:
+    if result.interrupted:
+        return ExitCode.INTERRUPTED
+    if result.stopped_domains:
+        for name, reason in result.stopped_domains.items():
+            typer.echo(f"domain stopped: {name}: {reason}", err=True)
+        return ExitCode.DOMAIN_STOPPED
+    return ExitCode.OK
 
 
 @app.callback()
@@ -16,3 +137,153 @@ def main() -> None:
 def version() -> None:
     """Print the package version."""
     typer.echo(__version__)
+
+
+@app.command()
+def discover(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+) -> None:
+    """Add seed URLs and plan links from pages already cached (offline)."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    result = _call(lambda: run_discover(settings, site))
+    typer.echo(
+        f"discover: {result.seeds_added} seeds and {result.links_added} links added, "
+        f"frontier {result.frontier_size}"
+    )
+
+
+@app.command()
+def fetch(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            "--retry-failed",
+            help="Re-queue failed_exhausted and stopped entries first (one more attempt each).",
+        ),
+    ] = False,
+) -> None:
+    """Fetch every pending URL politely into the cache (the only stage that uses the network)."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    result = _call(lambda: run_fetch(settings, site, retry_failed=retry_failed))
+    typer.echo(_fetch_line(result))
+    raise typer.Exit(int(_fetch_code(result)))
+
+
+def _fetch_line(result: FetchStageResult) -> str:
+    statuses = ", ".join(f"{k.value} {v}" for k, v in result.statuses.items() if v)
+    return (
+        f"fetch {result.run_id}: {result.attempts} attempts"
+        + (f" ({result.requests} requests)" if result.requests is not None else "")
+        + f", {result.recovered} recovered from "
+        f"cache, {result.links_added} links added; frontier: {statuses or 'empty'}"
+        + (" (interrupted)" if result.interrupted else "")
+    )
+
+
+@app.command()
+def parse(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+) -> None:
+    """Parse the cached pages into draft records with lineage (offline, deterministic)."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    result = _call(lambda: run_parse(settings, site))
+    typer.echo(
+        f"parse {result.parse_run_id}: {result.records} records from {result.pages_parsed} "
+        f"pages, {result.warnings} warnings"
+    )
+
+
+@app.command()
+def validate(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+) -> None:
+    """Check every draft against the contract; quarantine what fails. Exit 1 on a failing verdict."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    result = _call(lambda: run_validate(settings, site))
+    report = result.report
+    typer.echo(f"validate: {report.verdict.value.upper()}: {report.verdict_reason}")
+    raise typer.Exit(int(ExitCode.OK if result.passed else ExitCode.VALIDATION_FAILED))
+
+
+@app.command()
+def export(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+) -> None:
+    """Write Parquet and CSV deliverables and the run report. Exit 1 if validation failed."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    result = _call(lambda: run_export(settings, site))
+    typer.echo(f"export: {result.paths.output}")
+    raise typer.Exit(int(ExitCode.OK if result.passed else ExitCode.VALIDATION_FAILED))
+
+
+@app.command()
+def run(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+    max_pages: MaxPagesOption = None,
+    max_depth: MaxDepthOption = None,
+    retry_failed: Annotated[
+        bool, typer.Option("--retry-failed", help="Passed to the fetch stage.")
+    ] = False,
+) -> None:
+    """Run all five stages in order and print the run report (Markdown) to stdout."""
+    settings = _settings(data_dir, max_pages, max_depth)
+    started_at = utc_now_iso()
+    _call(lambda: run_discover(settings, site))
+    fetched = _call(lambda: run_fetch(settings, site, retry_failed=retry_failed))
+    fetch_code = _fetch_code(fetched)
+    if fetch_code is ExitCode.INTERRUPTED:
+        raise _fail("interrupted; progress is saved, re-run to resume", ExitCode.INTERRUPTED)
+    _call(lambda: run_parse(settings, site))
+    validated = _call(lambda: run_validate(settings, site))
+    exported = _call(lambda: run_export(settings, site, started_at=started_at))
+    typer.echo(exported.markdown, nl=False)
+    if fetch_code is ExitCode.DOMAIN_STOPPED:
+        raise typer.Exit(int(ExitCode.DOMAIN_STOPPED))
+    raise typer.Exit(int(ExitCode.OK if validated.passed else ExitCode.VALIDATION_FAILED))
+
+
+@app.command()
+def status(
+    site: SiteOption,
+    data_dir: DataDirOption = None,
+) -> None:
+    """Show frontier counts by status, open and stopped domains, and the latest runs."""
+    settings = _settings(data_dir, None, None)
+    with _guarded(), StateStore.open(settings.state_db) as store:
+        counts = store.counts(site)
+        stopped = stopped_domains(store, site)
+        seen = {e.domain for e in store.domain_events(site) if e.event is DomainEventKind.ROBOTS}
+        seen |= {domain_of(e.url) for e in store.entries(site)}
+        runs = store.runs(site)[-STATUS_RUNS:]
+    lines = [f"site: {site.value}", "", "frontier:"]
+    lines += [f"  {status.value:<17}{count}" for status, count in counts.items()]
+    lines += ["", "domains:"]
+    lines += [f"  {name}: open" for name in sorted(seen - set(stopped))]
+    lines += [f"  {name}: stopped ({reason})" for name, reason in stopped.items()]
+    if not seen and not stopped:
+        lines.append("  none yet")
+    lines += ["", "last runs:"]
+    lines += [
+        f"  {r.started_at}  {r.stage.value:<9}{r.status.value:<12}{r.run_id}"
+        for r in reversed(runs)
+    ]
+    if not runs:
+        lines.append("  none yet")
+    typer.echo("\n".join(lines))

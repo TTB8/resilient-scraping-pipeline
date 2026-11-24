@@ -17,6 +17,11 @@ What it serves, in order of precedence:
 
 4. Static files: ``tests/fixtures/sites/<site>/`` at their real paths (``/page/2/`` ->
    ``page/2/index.html``), and ``tests/fixtures/js/`` under ``/_js/``. Unknown paths are 404.
+   Like the real sites, a saved directory asked for without its trailing slash
+   (``/author/Albert-Einstein``, the form the quotes pages link to) answers ``301`` to the slashed
+   path. ``/static/<file>`` is served from ``tests/fixtures/js/static/`` when the saved site has no
+   such file: the captured JavaScript page loads ``/static/jquery.js``, which was not captured, and a
+   tiny stand-in there provides the one helper the page's script calls.
 
 Every request is logged (path, User-Agent, status, time) under a lock; :meth:`hits` counts them.
 """
@@ -228,6 +233,12 @@ class FixtureServer:
             base, rel = JS_PAGES, path.removeprefix("/_js/")
         else:
             base, rel = self.root, path.lstrip("/")
+            if path.startswith("/static/") and not (base / rel).is_file():
+                base = JS_PAGES
+        if rel and not rel.endswith("/"):
+            folder = (base / rel).resolve()
+            if folder.is_relative_to(base.resolve()) and (folder / "index.html").is_file():
+                return Phase(301, b"", {"Location": path + "/"})
         if rel == "" or rel.endswith("/"):
             rel += "index.html"
         target = (base / rel).resolve()
