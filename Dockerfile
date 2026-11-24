@@ -2,7 +2,12 @@
 # The `pipeline` CLI in a small image. Chromium is opt-in, because only the JS-rendered site needs it:
 #   docker build -t resilient-scraping-pipeline .
 #   docker build --build-arg WITH_BROWSER=1 -t resilient-scraping-pipeline:browser .
-#   docker run --rm -v "$PWD/data:/data" resilient-scraping-pipeline run --site books --max-depth 1
+#   mkdir -p data
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/data:/data" \
+#       resilient-scraping-pipeline run --site books --max-depth 1
+# --user runs the pipeline as you, so it can write the mounted ./data (a bind mount keeps the host
+# directory's owner; the image's own user, uid 10001, usually cannot write it). Without a writable
+# /data the CLI stops before any stage with exit code 2 and a message naming the path.
 
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 
@@ -16,6 +21,7 @@ WORKDIR /app
 # Dependencies first, so a code change does not re-download them.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
+COPY README.md ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
@@ -31,7 +37,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 RUN if [ "$WITH_BROWSER" = "1" ]; then \
         playwright install --with-deps chromium && chown -R pipeline /ms-playwright; \
     fi \
-    && mkdir -p /data && chown pipeline /data
+    && mkdir -p /data && chown pipeline /data && chmod 1777 /data
 USER pipeline
 WORKDIR /data
 VOLUME ["/data"]

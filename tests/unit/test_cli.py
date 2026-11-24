@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from typer.testing import CliRunner, Result
 
 from scraping_pipeline import __version__, cli
@@ -212,3 +213,139 @@ def test_cli_options_override_the_environment(
     monkeypatch.setenv("PIPELINE_MAX_DEPTH", "7")
     invoke("discover", "--site", "books", "--max-pages", "9", "--max-depth", "2")
     assert (seen[0].max_pages, seen[0].max_depth) == (9, 2)
+
+
+# --- exit codes for crashes and a broken environment (R2-06) --------------------------------------
+
+
+def test_an_unexpected_exception_exits_4_with_its_traceback_logged(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: object, **__: object) -> None:
+        raise KeyError("failures")  # e.g. a malformed staging file nobody anticipated
+
+    monkeypatch.setattr(cli, "run_parse", broken)
+    result = invoke("parse", "--site", "quotes")
+    assert result.exit_code == 4  # never 1: a crash must not read as "validation failed"
+    assert "internal error (KeyError" in result.stderr
+    assert '"event": "internal_error"' in result.stderr
+    assert "Traceback (most recent call last)" in result.stderr
+
+
+def test_a_crash_inside_run_exits_4_not_1(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripted_fetch(monkeypatch)
+
+    def broken(*_: object, **__: object) -> None:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(cli, "run_export", broken)
+    assert invoke("run", "--site", "quotes").exit_code == 4
+
+
+def test_a_browser_that_is_not_installed_exits_2_and_says_make_browsers(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_chromium(*_: object, **__: object) -> None:
+        raise PlaywrightError(
+            "BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium/chrome\n"
+            "Looks like Playwright was just installed or updated. Please run: playwright install"
+        )
+
+    monkeypatch.setattr(cli, "run_fetch", no_chromium)
+    result = invoke("fetch", "--site", "quotes-js")
+    assert result.exit_code == 2
+    assert "run `make browsers`" in result.stderr
+    assert "Executable doesn't exist" in result.stderr
+
+
+def test_any_other_playwright_error_is_an_internal_error(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: object, **__: object) -> None:
+        raise PlaywrightError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(cli, "run_fetch", broken)
+    assert invoke("fetch", "--site", "quotes-js").exit_code == 4
+
+
+def test_a_data_dir_that_is_a_file_exits_2_with_the_path(
+    invoke: Callable[..., Result], tmp_path: Path
+) -> None:
+    (tmp_path / "data").write_text("not a directory")
+    for command in ("discover", "fetch", "parse", "validate", "export", "run"):
+        result = invoke(command, "--site", "books")
+        assert result.exit_code == 2, (command, result.stderr)
+        assert str(tmp_path / "data") in result.stderr
+        assert "cannot be written or opened" in result.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_unwritable_data_dir_exits_2_and_names_the_docker_fix(
+    invoke: Callable[..., Result], tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o500)
+    try:
+        result = invoke("discover", "--site", "books")
+    finally:
+        data.chmod(0o700)
+    assert result.exit_code == 2
+    assert str(data) in result.stderr
+    assert '--user "$(id -u):$(id -g)"' in result.stderr
+    assert not (data / "state.duckdb").exists()
+
+
+def test_an_os_error_on_a_data_file_exits_2_with_its_path(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "data" / "quotes" / "parsed" / "records.jsonl"
+
+    def disk_full(*_: object, **__: object) -> None:
+        raise OSError(28, "No space left on device", str(target))
+
+    monkeypatch.setattr(cli, "run_parse", disk_full)
+    result = invoke("parse", "--site", "quotes")
+    assert result.exit_code == 2
+    assert str(target) in result.stderr
+    assert "No space left on device" in result.stderr
+
+
+def test_an_os_error_outside_the_data_dir_is_an_internal_error(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def elsewhere(*_: object, **__: object) -> None:
+        raise OSError(2, "No such file or directory", "/nonexistent/somewhere/else")
+
+    monkeypatch.setattr(cli, "run_parse", elsewhere)
+    assert invoke("parse", "--site", "quotes").exit_code == 4
+
+
+def test_an_unopenable_state_database_exits_2_with_its_path(
+    invoke: Callable[..., Result], tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "state.duckdb").write_bytes(b"this is not a duckdb file" * 100)
+    result = invoke("discover", "--site", "books")
+    assert result.exit_code == 2, result.stderr
+    assert str(data / "state.duckdb") in result.stderr
+
+
+def test_status_does_not_create_a_state_database(
+    invoke: Callable[..., Result], tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    result = invoke("status", "--site", "books")
+    assert result.exit_code == 0
+    assert "pending          0" in result.stdout
+    assert list(data.iterdir()) == []
+    assert not (tmp_path / "data2").exists()
+    elsewhere = CliRunner().invoke(
+        cli.app, ["status", "--site", "books", "--data-dir", str(tmp_path / "data2")], env=FAST_ENV
+    )
+    assert elsewhere.exit_code == 0
+    assert not (tmp_path / "data2").exists()

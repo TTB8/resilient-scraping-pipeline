@@ -20,6 +20,7 @@ from scraping_pipeline.core.parsers import books as books_parser
 from scraping_pipeline.core.types import FrontierStatus, PageKind, ResponseClass, Site
 from scraping_pipeline.core.validate import Verdict
 from scraping_pipeline.fetch.fake import FakeFetcher
+from scraping_pipeline.sites import get_site
 from scraping_pipeline.stages import run_export, run_parse, run_validate
 from scraping_pipeline.stages.common import SitePaths, StageInputError, read_jsonl
 from scraping_pipeline.stages.export import QUARANTINE_COLUMNS, _page_counts, arrow_schema
@@ -259,6 +260,90 @@ def test_export_refuses_stale_or_tampered_staging(quotes_settings: Settings) -> 
     stats.write_text(json.dumps({**data, "parse_run_id": "ffffffffffffffff"}))
     with pytest.raises(StageInputError, match="re-run validate"):
         run_export(quotes_settings, Site.QUOTES)
+
+
+def test_export_refuses_a_stale_validation_even_with_no_valid_rows(
+    quotes_settings: Settings,
+) -> None:
+    """R2-12: the staleness guard must not depend on there being valid rows to carry the id."""
+    first = run_parse(quotes_settings, Site.QUOTES)
+    validated = run_validate(quotes_settings, Site.QUOTES)
+    report = json.loads(validated.paths.validation_report.read_text())
+    assert report["parse_run_id"] == first.parse_run_id
+    # A batch where every row was quarantined: the valid tables are empty.
+    for table in ("authors", "quotes"):
+        validated.paths.valid_rows(table).write_text("")
+
+    # The site is fetched again (same bodies, another fetch run) and parsed, but not validated.
+    cache = PageCache(quotes_settings.cache_dir)
+    for entry in list(cache.iter_entries()):
+        cache.put(
+            entry.url,
+            cache.read_body(entry),
+            FetchMeta(entry.final_url, entry.status, entry.fetched_at, "fetch-again", "httpx"),
+        )
+    again = run_parse(quotes_settings, Site.QUOTES)
+    assert again.parse_run_id != first.parse_run_id
+    with pytest.raises(StageInputError, match=r"validation_report\.json is from parse run"):
+        run_export(quotes_settings, Site.QUOTES)
+
+    # The quarantine is checked on its own too (a report from the right parse is not enough).
+    validated.paths.validation_report.write_text(
+        json.dumps({**report, "parse_run_id": again.parse_run_id})
+    )
+    with pytest.raises(StageInputError, match=r"quarantine\.jsonl is from parse run"):
+        run_export(quotes_settings, Site.QUOTES)
+
+    # Re-validating makes everything current again.
+    run_validate(quotes_settings, Site.QUOTES)
+    assert run_export(quotes_settings, Site.QUOTES).report.parse_run_id == again.parse_run_id
+
+
+def test_export_refuses_a_validation_report_without_a_parse_run_id(
+    quotes_settings: Settings,
+) -> None:
+    run_parse(quotes_settings, Site.QUOTES)
+    validated = run_validate(quotes_settings, Site.QUOTES)
+    report = json.loads(validated.paths.validation_report.read_text())
+    del report["parse_run_id"]
+    validated.paths.validation_report.write_text(json.dumps(report))
+    with pytest.raises(StageInputError, match="is from parse run None"):
+        run_export(quotes_settings, Site.QUOTES)
+    validated.paths.validation_report.write_text("[]")
+    with pytest.raises(StageInputError, match="expected an object"):
+        run_export(quotes_settings, Site.QUOTES)
+
+
+def test_export_reports_a_malformed_quarantine_as_bad_input(quotes_settings: Settings) -> None:
+    run_parse(quotes_settings, Site.QUOTES)
+    validated = run_validate(quotes_settings, Site.QUOTES)
+    validated.paths.quarantine.write_text('{"row_key": "x"}\n')
+    with pytest.raises(StageInputError, match="malformed row"):
+        run_export(quotes_settings, Site.QUOTES)
+
+
+def test_validate_refuses_records_from_another_parse(quotes_settings: Settings) -> None:
+    parsed = run_parse(quotes_settings, Site.QUOTES)
+    stats = json.loads(parsed.paths.parse_stats.read_text())
+    parsed.paths.parse_stats.write_text(json.dumps({**stats, "parse_run_id": "ffffffffffffffff"}))
+    with pytest.raises(StageInputError, match="re-run parse"):
+        run_validate(quotes_settings, Site.QUOTES)
+
+
+def test_validated_rows_are_sorted_by_the_table_key(quotes_settings: Settings) -> None:
+    """The docstring promises ``validated/<table>.jsonl`` in key order (export re-sorts anyway)."""
+    run_parse(quotes_settings, Site.QUOTES)
+    validated = run_validate(quotes_settings, Site.QUOTES)
+    text_order_differs = False
+    for table in get_site(Site.QUOTES).tables:
+        lines = validated.paths.valid_rows(table.name).read_text().splitlines()
+        keys = [tuple(json.loads(line)[k] for k in table.sort_key) for line in lines]
+        assert len(keys) > 1, table.name  # otherwise the order proves nothing
+        assert keys == sorted(keys), table.name
+        text_order_differs |= sorted(lines) != lines
+    # Sorting the JSON text instead would put these rows in another order, so this test tells
+    # key order from text order.
+    assert text_order_differs
 
 
 @pytest.mark.slow

@@ -22,7 +22,10 @@ Outputs, under ``<data_dir>/<site>/validated/``, canonical JSON, written atomica
   the contract's own JSON form (decimals as exact strings, dates in ISO form);
 * ``quarantine.jsonl``: ``QuarantinedRow.to_dict()`` per rejected row, in validation's canonical
   order;
-* ``validation_report.json``: counts, rule counts, every failure and the verdict.
+* ``validation_report.json``: counts, rule counts, every failure and the verdict, plus the
+  ``parse_run_id`` of the parse it validated (from ``parse_stats.json``). Export compares it with
+  the current parse, so a report, quarantine and verdict from an older parse are refused even when
+  there are no valid rows to carry the id.
 """
 
 from __future__ import annotations
@@ -100,7 +103,17 @@ def run_validate(settings: Settings, site: Site) -> ValidateStageResult:
         StateStore.open(settings.state_db) as store,
         stage_run(store, settings, site, Stage.VALIDATE) as run,
     ):
+        stats = read_json(paths.parse_stats)
+        if not isinstance(stats, dict) or not isinstance(stats.get("parse_run_id"), str):
+            raise StageInputError(f"{paths.parse_stats}: no parse_run_id")
+        parse_run_id: str = stats["parse_run_id"]
         candidates = load_candidates(paths)
+        stale = {c.lineage.parse_run_id for c in candidates} - {parse_run_id}
+        if stale:
+            raise StageInputError(
+                f"{paths.records} holds rows from parse run {sorted(stale)[0]}, not "
+                f"{parse_run_id}: re-run parse"
+            )
         context = read_json(paths.context)
         if not isinstance(context, dict):
             raise StageInputError(f"{paths.context}: expected an object")
@@ -118,11 +131,15 @@ def run_validate(settings: Settings, site: Site) -> ValidateStageResult:
             atomic_write_text(paths.valid_rows(table.name), "".join(f"{j}\n" for _, j in lines))
             rows_by_table[table.name] = len(lines)
         write_jsonl(paths.quarantine, (row.to_dict() for row in result.quarantined))
-        write_json(paths.validation_report, result.report.model_dump(mode="json"))
+        write_json(
+            paths.validation_report,
+            {**result.report.model_dump(mode="json"), "parse_run_id": parse_run_id},
+        )
 
         report = result.report
         run.status = RunStatus.SUCCEEDED if report.verdict is Verdict.PASS else RunStatus.FAILED
         run.summary = {
+            "parse_run_id": parse_run_id,
             "verdict": report.verdict.value,
             "verdict_reason": report.verdict_reason,
             "total_rows": report.total_rows,

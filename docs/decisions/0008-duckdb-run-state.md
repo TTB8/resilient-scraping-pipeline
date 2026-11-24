@@ -30,13 +30,14 @@ everything. A log file is hard to query and easy to corrupt.
 
 - The resumability test can kill the fetch stage midway, re-run it, and assert from the server's
   request log that no completed page was requested twice.
-- The run report is a handful of SQL queries.
+- The run report is built in Python from a few `StateStore` reads (the frontier, the runs and the
+  domain events) plus the parse and validation files; no ad-hoc SQL outside the store.
 - Re-queueing failed or stopped URLs is an explicit operator action (`--retry-failed`). A default
   run never re-fetches a URL that reached a final state.
 
 ## Alternatives considered
 
 - **SQLite.** Equally valid for the state. DuckDB was chosen because the same engine reads the
-  Parquet deliverables and answers report queries in SQL. It has one fewer dependency than a
+  Parquet deliverables and answers ad-hoc questions about a run in SQL. It has one fewer dependency than a
   SQLite-plus-pandas setup.
 - **Files only (JSON per URL).** No transactions, so the two-write problem would be everywhere.

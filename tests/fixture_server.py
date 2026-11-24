@@ -8,7 +8,9 @@ What it serves, in order of precedence:
 
 1. ``/robots.txt``: the configured ``robots_txt`` body, or 404 (RFC 9309: "allow all") when unset.
    Robots requests never consume scenario steps, so a scenario counts page requests only.
-2. ``routes``: exact-path overrides set with :meth:`FixtureServer.route` (redirects, big bodies...).
+2. ``routes``: exact-path overrides set with :meth:`FixtureServer.route` (redirects, big bodies...),
+   or a per-path sequence set with :meth:`FixtureServer.path_scenario` ("429 the first time this
+   page is asked for, then serve it"), which does not depend on the order requests arrive in.
 3. The active **scenario**: a list of :class:`Phase` values, each answering ``times`` requests
    (``None`` = forever) before the next takes over. ``Phase.serve()`` means "answer normally".
    Example, "after 2 good pages, 429 once, then a block page forever"::
@@ -134,6 +136,8 @@ class FixtureServer:
         self._lock = threading.Lock()
         self._log: list[Hit] = []
         self._routes: dict[str, Phase] = {}
+        self._path_phases: dict[str, list[Phase]] = {}
+        self._path_used: dict[str, int] = {}
         self._phases: list[Phase] = []
         self._used = 0  # requests answered by the current phase
         self._httpd = _Server(("127.0.0.1", 0), _Handler)
@@ -179,6 +183,14 @@ class FixtureServer:
         with self._lock:
             self._routes[path] = phase
 
+    def path_scenario(self, path: str, *phases: Phase) -> None:
+        """Answer requests for ``path`` with ``phases`` in turn (each ``times`` requests, ``None``
+        = forever), then as if no path scenario were set. Unlike :meth:`scenario`, the steps count
+        only this path's requests, so the result does not depend on request order."""
+        with self._lock:
+            self._path_phases[path] = list(phases)
+            self._path_used[path] = 0
+
     def redirect(self, path: str, to: str, status: int = 302) -> None:
         self.route(path, Phase(status, b"", {"Location": to}))
 
@@ -209,6 +221,18 @@ class FixtureServer:
                 self._used = 0
             return Phase.serve()
 
+    def _next_path_phase(self, path: str) -> Phase | None:
+        with self._lock:
+            phases = self._path_phases.get(path)
+            while phases:
+                phase = phases[0]
+                if phase.times is None or self._path_used[path] < phase.times:
+                    self._path_used[path] += 1
+                    return phase
+                phases.pop(0)
+                self._path_used[path] = 0
+            return None
+
     def handle(self, request: _Handler) -> None:
         path = urlsplit(request.path).path
         if path == "/robots.txt":
@@ -220,6 +244,8 @@ class FixtureServer:
             return
         with self._lock:
             routed = self._routes.get(path)
+        if routed is None:
+            routed = self._next_path_phase(path)
         phase = routed if routed is not None else self._next_phase()
         if phase.delay_s > 0:
             time.sleep(phase.delay_s)

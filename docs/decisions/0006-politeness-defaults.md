@@ -25,7 +25,8 @@ Defaults (`config.py`, all validated at start-up, so a bad value fails before th
   it never answers the domain is stopped. There is no setting to turn robots.txt off; an unknown
   setting is a validation error.
 - **The User-Agent is honest.** It must lead with this crawler's own `name/version` token, include
-  a contact URL or e-mail address, and not contain a browser's or another crawler's identity.
+  a contact URL or e-mail address, and not contain a well-known browser or crawler identity (a
+  denylist of product tokens, so it catches the common ones, not every crawler's name).
 - The ceilings are constants in code. Raising one is a reviewed code change, not an environment
   variable.
 

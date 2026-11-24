@@ -23,7 +23,8 @@ All notable changes to this project. The format follows
   - lenient parsers, versioned contracts, and validation with quarantine.
 - A polite async scheduler:
   - per-domain rate and concurrency limits;
-  - same-site redirect following, with every hop checked;
+  - same-site redirect following, with every hop checked, for the browser too (the page is
+    requested with redirects off);
   - one overall deadline per request;
   - domain stop on blocks, challenges and long `Retry-After` or `Crawl-delay`.
 - Storage:

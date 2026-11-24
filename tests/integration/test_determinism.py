@@ -73,7 +73,9 @@ def test_offline_stages_are_byte_identical_in_a_fresh_process(quotes_settings: S
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("PIPELINE_")}
     env["PYTHONHASHSEED"] = "12345"
-    for stage in ("parse", "validate", "export"):
+    # The saved quotes data fails validation (most authors were never saved), so validate and
+    # export exit 1. Exactly 1: a crash exits 4 and would fail here.
+    for stage, expected in (("parse", 0), ("validate", 1), ("export", 1)):
         done = subprocess.run(  # noqa: S603 - our own interpreter and CLI, fixed arguments
             [
                 sys.executable,
@@ -92,5 +94,5 @@ def test_offline_stages_are_byte_identical_in_a_fresh_process(quotes_settings: S
             check=False,
             timeout=50,
         )
-        assert done.returncode in (0, 1), done.stderr  # 1: the quotes data fails validation
+        assert done.returncode == expected, (stage, done.stderr)
     assert _data_files(quotes_settings, site) == first

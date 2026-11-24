@@ -30,7 +30,7 @@ specific answer here.
 | **can't reproduce its output**: two runs, two files, no way to tell what changed | the same cache gives **byte-identical** outputs, and the run id on every row is derived from the inputs | [ADR 0003](docs/decisions/0003-deterministic-outputs.md) |
 | **breaks when the site pushes back**: hammers through 429s, or reaches for proxies and stealth plugins | classifies every response, honours `Retry-After`, backs off with jitter, trips a per-domain circuit breaker and **stops the domain** with a clear reason. It detects blocks and never evades them | [ADR 0005](docs/decisions/0005-detection-not-evasion.md) |
 | **is rude by default**: no robots.txt, a fake browser User-Agent, unbounded concurrency | obeys robots.txt (RFC 9309), sends an honest User-Agent with a contact URL, defaults to one request per second per domain, and enforces hard ceilings in code | [ADR 0006](docs/decisions/0006-politeness-defaults.md) |
-| **wanders off**: follows redirects anywhere, including internal addresses | confines the crawl to its site. Every redirect hop is robots-checked and rate-limited, and an off-site one is refused | [ADR 0009](docs/decisions/0009-site-confinement.md) |
+| **wanders off**: follows redirects anywhere, including internal addresses | confines the crawl to its site. Every redirect hop is robots-checked and rate-limited, and an off-site one is refused, in the browser too (it requests the page with redirects off and hands each 3xx to the same rules) | [ADR 0009](docs/decisions/0009-site-confinement.md) |
 
 ## The pipeline
 
@@ -41,11 +41,14 @@ flowchart LR
     state --> fetch["<b>fetch</b><br/>robots.txt, rate limit, breaker,<br/>retries, redirects, Playwright for JS"]
     fetch -- "raw pages" --> cache[(content-addressed<br/>cache)]
     fetch -- "attempts, status,<br/>new links" --> state
+    cache -- "links on cached pages<br/>(offline expansion)" --> discover
     cache --> parse["<b>parse</b><br/>offline, deterministic<br/>lenient drafts + lineage"]
+    state -- "page kinds" --> parse
     parse --> validate["<b>validate</b><br/>versioned contract<br/>uniqueness, referential checks"]
-    validate -- valid rows --> export["<b>export</b><br/>Parquet + CSV<br/>run report"]
-    validate -- failing rows --> quarantine[[quarantine.csv<br/>with reasons]]
-    export --> deliverables[[books.parquet, quotes.csv,<br/>run_report.md, ...]]
+    validate -- "valid rows" --> export["<b>export</b><br/>Parquet + CSV<br/>run report"]
+    validate -- "failing rows" --> quarantine[(quarantine.jsonl<br/>with reasons)]
+    quarantine --> export
+    export --> deliverables[[books.parquet, quotes.csv,<br/>quarantine.csv, run_report.md, ...]]
 ```
 
 Each stage is its own command and is safe to re-run. `discover` is insert-only, `fetch` only
@@ -54,8 +57,10 @@ fetches what is missing, and `parse`, `validate` and `export` are pure functions
 
 ## How a response is handled
 
-Every response is classified first. Then the reaction depends only on the class, so the policy
-for each kind of failure lives in one place
+Every response is classified first, after one check that comes before any class: a `3xx` with a
+`Location` is a redirect, and the hop is followed only on the same site, as a new request (robots.txt,
+a token, the breaker). Then the reaction depends only on the class, so the policy for each kind of
+failure lives in one place
 ([`core/classify.py`](src/scraping_pipeline/core/classify.py),
 [`core/retry.py`](src/scraping_pipeline/core/retry.py),
 [`core/circuit.py`](src/scraping_pipeline/core/circuit.py)).
@@ -65,6 +70,8 @@ stateDiagram-v2
     direction LR
     [*] --> Admitted: robots.txt allows, token from the rate limiter, breaker closed
     Admitted --> Classified: fetch (one overall deadline)
+    Admitted --> Admitted: 3xx on the same site, the hop is a new request (at most 5 hops)
+    Admitted --> FailedPermanent: 3xx off-site, or too many hops
 
     state Classified {
         direction LR
@@ -80,13 +87,14 @@ stateDiagram-v2
     }
 
     Classified --> Done: ok
-    Classified --> FailedPermanent: not_found / client_error / off-site redirect
+    Classified --> FailedPermanent: not_found / client_error
     Classified --> Waiting: rate_limited (wait at least Retry-After, slow the domain down)
     Classified --> Waiting: server_error / timeout / network_error (exponential backoff, full jitter)
     Waiting --> Admitted: delay elapsed, attempts remain
     Waiting --> FailedExhausted: max attempts reached
     Classified --> DomainStopped: blocked / challenge / Retry-After too long
     Waiting --> DomainStopped: breaker keeps reopening
+    [*] --> DomainStopped: robots.txt unreachable, or Crawl-delay too long
 
     Done --> [*]
     FailedPermanent --> [*]
@@ -107,9 +115,13 @@ make demo                                       # offline: runs against a local 
 uv run pipeline run --site books --max-depth 1  # live: about 70 pages at 1 request per second
 ```
 
-`make demo` runs the books site cleanly, then a quotes site that starts rate-limiting and then
-serves a block page. You see the pipeline back off, stop the domain, explain why in the report,
-and still deliver what it fetched (exit code 3).
+`make demo` runs the books site cleanly (exit code 0), then the quotes site while the local server
+pushes back. `/page/2/` first answers `429` with `Retry-After: 1`: the pipeline slows the domain
+down and fetches it on a retry more than a second later. Then an author page answers `403` with a
+block page: the domain is stopped and nothing more is sent. The report names the block, and the
+valid rows (6 quotes, 2 authors) are still delivered, the rest quarantined with reasons (exit
+code 3). The demo prints the server's timeline and checks this story itself: it exits non-zero
+if any part of it does not hold, so CI catches a regression.
 
 Outputs go to `./data/output/<site>/`. Each stage can also be run on its own:
 
@@ -127,24 +139,33 @@ For the JavaScript-rendered site: `make browsers`, then `uv run pipeline run --s
 **Docker:**
 
 ```bash
-docker build -t resilient-scraping-pipeline .                      # add --build-arg WITH_BROWSER=1 for quotes-js
-docker run --rm -v "$PWD/data:/data" resilient-scraping-pipeline run --site books --max-depth 1
+docker build -t resilient-scraping-pipeline .    # add --build-arg WITH_BROWSER=1 for quotes-js
+mkdir -p data
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/data:/data" \
+    resilient-scraping-pipeline run --site books --max-depth 1
 ```
+
+`--user` runs the container as you, so it can write the mounted `./data` (a bind mount keeps the
+host directory's owner, which the image's own user cannot write). Without it the pipeline stops
+before any stage with exit code 2 and a message naming `/data`. CI runs this mount.
 
 **Exit codes** are part of the interface, so a scheduler can react without reading logs:
 
 | Code | Meaning |
 |---|---|
 | 0 | everything ran and the data passed validation |
-| 1 | validation failed: valid rows are delivered, failing rows are in `quarantine.csv` |
-| 2 | usage error: a bad option or setting, a missing stage input, or the state database is in use |
+| 1 | validation failed: valid rows are delivered, failing rows are in `quarantine.csv`. Only this: a crash is 4 |
+| 2 | usage or environment error: a bad option or setting, a missing stage input, the state database in use, a data directory that cannot be written (the message names the path), or Chromium not installed (`make browsers`) |
 | 3 | a domain was stopped (blocked, a challenge, rate-limited beyond limits). The rest still ran |
+| 4 | internal error: an unexpected exception (a bug), logged with its traceback as `internal_error`. Infer nothing about the data |
 | 130 | interrupted. Progress is saved; run the same command again to resume |
 
 ## A real run report
 
 From the committed [example output](examples/): `pipeline run --site quotes` against the live
-site, the whole site.
+site, the whole site. (The examples predate two report lines added since: `Pages fetched by`, the
+fetch runs behind the rows, and the request total over those runs. On a first run both equal the
+figures shown.)
 
 ```markdown
 ## Pages
@@ -183,7 +204,7 @@ refused them. The contract caught the bug instead of shipping quotes without aut
 | `source_url` | the page the row came from |
 | `content_sha256` | the exact bytes it was parsed from (look the page up in the cache) |
 | `fetch_run_id` | which crawl fetched that page |
-| `parse_run_id` | derived from (those pages, parser version, contract version): same inputs, same id |
+| `parse_run_id` | derived from the site's cache manifest (each page's URL, content hash and `fetch_run_id`), the parser version and the contract version: same inputs, same id |
 | `parser_version`, `contract_version` | which code and which rules produced it |
 
 ## Testing
@@ -203,9 +224,9 @@ redirect, or serve block and challenge pages.
 - **Determinism test:** run `parse`, `validate` and `export` twice, and once in a fresh interpreter, then compare every data file byte for byte.
 - **Resumability test:** kill `fetch` midway, also between the cache write and the state write, and run it again. No page whose result was recorded is requested twice, and the final frontier and cache match an uninterrupted run's.
 - **Integration tests** against the fixture server, including a site that starts returning 429s and then a block page: the domain is stopped, the run exits 3, and the report names the reason.
-- **Browser tests** for the JS-rendered site, with real Chromium in CI.
-- **Mutation checks.** Each important rule was broken on purpose to prove that a test fails, more than 80 mutants in total.
-- **Independent review.** A separate reviewer audited the code adversarially. Every finding was fixed with a test that fails without the fix; [ADR 0009](docs/decisions/0009-site-confinement.md) is one result.
+- **Browser tests** for the JS-rendered site run in CI with Chromium (`playwright install --with-deps chromium`); CI fails rather than skips them if Chromium cannot launch. Locally they skip when Chromium is missing.
+- **Mutation checks.** During development and review, important rules were broken on purpose to check that a test fails. The mutation scripts and their logs are not part of this repository.
+- **Independent review.** A separate reviewer audited the code adversarially, in two rounds. Findings were fixed with regression tests (the reasons are in the commit history and [`harness-lessons.md`](harness-lessons.md)); [ADR 0009](docs/decisions/0009-site-confinement.md) is one result.
 
 ## Adapting it to a new site
 
@@ -229,7 +250,7 @@ All settings are `PIPELINE_*` environment variables (or a `.env` file), validate
 |---|---|---|
 | `PIPELINE_REQUESTS_PER_SECOND` | 1.0 | per domain, ceiling 5 |
 | `PIPELINE_MAX_CONCURRENCY_PER_DOMAIN` | 2 | ceiling 8 |
-| `PIPELINE_USER_AGENT` | `resilient-scraping-pipeline/0.1 (+https://github.com/TTB8/...)` | must lead with its own name/version and a contact. Browser or other crawler identities are refused |
+| `PIPELINE_USER_AGENT` | `resilient-scraping-pipeline/0.1 (+https://github.com/TTB8/...)` | must lead with its own name/version and a contact. Well-known browser and crawler identities are refused |
 | `PIPELINE_MAX_RETRY_AFTER_S` | 300 | a longer `Retry-After` stops the domain |
 | `PIPELINE_MAX_FAILURE_RATE` | 0.0 | share of rows allowed to fail the contract |
 | `PIPELINE_MAX_PAGES`, `PIPELINE_MAX_DEPTH` | unset | crawl scope |
