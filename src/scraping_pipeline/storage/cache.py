@@ -42,7 +42,7 @@ import io
 import json
 import re
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -247,14 +247,24 @@ class PageCache:
         entries = [entry for _, entry in self._walk_entries() if entry is not None]
         return iter(sorted(entries, key=lambda entry: entry.url))
 
-    def manifest_sha256(self) -> str:
+    def manifest_sha256(self, urls: Iterable[str] | None = None) -> str:
         """sha256 over the sorted ``(url, content_sha256)`` pairs of all valid entries.
 
         Each pair is encoded as a JSON array on its own line after a version header, so the
         encoding is unambiguous whatever characters a URL contains.
+
+        ``urls`` restricts the manifest to those URLs' valid entries (URLs without one are simply
+        absent), so one site's parse run id does not change when another site's pages are fetched
+        into the same cache. The encoding is the same either way: the manifest of a subset equals
+        the full manifest of a cache that holds only that subset. Order and repeats in ``urls`` do
+        not matter.
         """
         digest = hashlib.sha256(_MANIFEST_VERSION)
-        pairs = sorted((entry.url, entry.content_sha256) for entry in self.iter_entries())
+        if urls is None:
+            selected: Iterable[CacheEntry] = self.iter_entries()
+        else:
+            selected = (e for url in set(urls) if (e := self.get_entry(url)) is not None)
+        pairs = sorted((entry.url, entry.content_sha256) for entry in selected)
         for url, content_sha256 in pairs:
             line = json.dumps([url, content_sha256], ensure_ascii=True, separators=(",", ":"))
             digest.update(line.encode("ascii") + b"\n")

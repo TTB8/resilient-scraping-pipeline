@@ -421,3 +421,28 @@ def test_scan_can_verify_object_integrity(cache: PageCache) -> None:
 def test_scan_of_a_missing_cache_is_empty(cache: PageCache) -> None:
     scan = cache.scan()
     assert (scan.entries, scan.objects, scan.healthy) == (0, 0, True)
+
+
+def test_manifest_url_filter_covers_only_named_entries(cache: PageCache, tmp_path: Path) -> None:
+    cache.put(URL_A, BODY, meta())
+    cache.put(URL_B, b"b", meta())
+    full = cache.manifest_sha256()
+    # Naming every URL (in any order, with repeats) is the full manifest, byte for byte.
+    assert cache.manifest_sha256([URL_B, URL_A, URL_A]) == full
+    # A subset hashes like a cache that holds only that subset.
+    only_a = PageCache(tmp_path / "only-a")
+    only_a.put(URL_A, BODY, meta())
+    assert cache.manifest_sha256([URL_A]) == only_a.manifest_sha256()
+    assert cache.manifest_sha256([URL_A]) != full
+    # URLs without an entry are absent, not an error; no URLs is the empty manifest.
+    assert cache.manifest_sha256([URL_A, "https://books.toscrape.com/missing"]) == (
+        only_a.manifest_sha256()
+    )
+    assert cache.manifest_sha256([]) == PageCache(tmp_path / "empty").manifest_sha256()
+
+
+def test_manifest_url_filter_skips_damaged_entries(cache: PageCache) -> None:
+    cache.put(URL_A, BODY, meta())
+    cache.put(URL_B, b"b", meta())
+    entry_path(cache, URL_B).write_bytes(b"{not json")
+    assert cache.manifest_sha256([URL_A, URL_B]) == cache.manifest_sha256()
