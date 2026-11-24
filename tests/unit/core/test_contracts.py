@@ -106,8 +106,8 @@ def test_rows_are_frozen() -> None:
         ({"title": ""}, "string_too_short"),
         ({"title": " padded "}, "string_pattern_mismatch"),
         ({"category": ""}, "string_too_short"),
-        ({"product_url": "http://books.toscrape.com/x"}, "url_not_https"),
-        ({"image_url": "media/x.jpg"}, "url_not_https"),
+        ({"product_url": "ftp://books.toscrape.com/x"}, "url_not_http"),
+        ({"image_url": "media/x.jpg"}, "url_not_http"),
         ({"image_url": "https://Books.toscrape.com/x"}, "url_not_canonical"),
         ({"in_stock": False}, "in_stock_mismatch"),
         ({"content_sha256": "xyz"}, "string_pattern_mismatch"),
@@ -177,3 +177,13 @@ def test_contract_versions() -> None:
 def test_out_of_stock_is_consistent_and_zero_in_stock_is_not() -> None:
     assert Book.model_validate({**BOOK, "stock_count": 0, "in_stock": False}).in_stock is False
     assert rule_of(Book, {**BOOK, "stock_count": 0, "in_stock": True}) == {"in_stock_mismatch"}
+
+
+def test_http_fixture_server_urls_validate_and_other_schemes_do_not() -> None:
+    # The integration tests crawl a local fixture server over plain http.
+    local = "http://127.0.0.1:8765/catalogue/x_1/index.html"
+    row = {**BOOK, "source_url": local, "product_url": local}
+    row["image_url"] = "http://127.0.0.1:8765/media/x.jpg"
+    assert Book.model_validate(row).source_url == local
+    ftp = {**row, "source_url": "ftp://127.0.0.1:8765/catalogue/x_1/index.html"}
+    assert rule_of(Book, ftp) == {"url_not_http"}

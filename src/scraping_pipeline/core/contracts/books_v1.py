@@ -30,7 +30,7 @@ from typing import Annotated, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from scraping_pipeline.core.contracts.base import STRICT, HttpsUrl, LineageColumns, NonEmptyStr
+from scraping_pipeline.core.contracts.base import STRICT, LineageColumns, NonEmptyStr, WebUrl
 
 CONTRACT_VERSION = "books/1.0.0"
 
@@ -48,8 +48,8 @@ class _BookColumns(BaseModel):
     rating: Annotated[int, Field(ge=1, le=5)]
     category: NonEmptyStr
     description: str
-    product_url: HttpsUrl
-    image_url: HttpsUrl
+    product_url: WebUrl
+    image_url: WebUrl
 
     @field_validator("price_gbp")
     @classmethod

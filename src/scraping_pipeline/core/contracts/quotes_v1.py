@@ -29,10 +29,10 @@ from pydantic_core import PydanticCustomError
 
 from scraping_pipeline.core.contracts.base import (
     STRICT,
-    HttpsUrl,
     LineageColumns,
     NonEmptyStr,
     Sha256Hex,
+    WebUrl,
 )
 from scraping_pipeline.core.text import quote_id as derive_quote_id
 
@@ -61,7 +61,7 @@ class _QuoteColumns(BaseModel):
     author_name: NonEmptyStr
     author_slug: Slug | None = None
     tags: Annotated[tuple[str, ...], AfterValidator(_canonical_tags)]
-    page_url: HttpsUrl
+    page_url: WebUrl
 
     @model_validator(mode="after")
     def _id_matches_content(self) -> Self:

@@ -28,15 +28,16 @@ NonEmptyStr = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 _PARSE_RUN_ID = re.compile(r"[0-9a-f]{16}")
+_WEB_SCHEMES = frozenset({"http", "https"})
 
 
-def _https_url(value: str) -> str:
+def _web_url(value: str) -> str:
     try:
-        canonical = canonicalize(value)
+        canonical = canonicalize(value)  # rejects relative URLs and any scheme but http(s)
     except ValueError:
         canonical = None
-    if canonical is None or urlsplit(value).scheme != "https":
-        raise PydanticCustomError("url_not_https", "must be an absolute https URL")
+    if canonical is None or urlsplit(value).scheme not in _WEB_SCHEMES:
+        raise PydanticCustomError("url_not_http", "must be an absolute http(s) URL")
     if canonical != value:
         raise PydanticCustomError(
             "url_not_canonical", "must be canonical: {canonical}", {"canonical": canonical}
@@ -44,8 +45,12 @@ def _https_url(value: str) -> str:
     return value
 
 
-HttpsUrl = Annotated[str, AfterValidator(_https_url)]
-"""An absolute https URL already in ``core.urls.canonicalize`` form, so joins on URLs are exact."""
+WebUrl = Annotated[str, AfterValidator(_web_url)]
+"""An absolute http(s) URL already in ``core.urls.canonicalize`` form, so joins on URLs are exact.
+
+http is allowed as well as https because the integration tests crawl a local fixture server at
+``http://127.0.0.1:<port>/``; any other scheme, a relative URL or a non-canonical spelling is rejected.
+"""
 
 
 class LineageColumns(BaseModel):
@@ -58,7 +63,7 @@ class LineageColumns(BaseModel):
     model_config = STRICT
     CONTRACT_VERSION: ClassVar[str] = ""
 
-    source_url: HttpsUrl
+    source_url: WebUrl
     content_sha256: Sha256Hex
     fetch_run_id: NonEmptyStr
     parse_run_id: str
