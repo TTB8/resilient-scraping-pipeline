@@ -211,3 +211,14 @@ def test_is_due() -> None:
     assert not is_due(scheduled, 109.99)
     assert is_due(scheduled, 110.0)
     assert not is_due(apply_decision(fresh, OK, None, 0.0), 1e12)
+
+
+def test_other_port_on_same_host_is_not_planned() -> None:
+    # Another port is another server: it must not share this site's bucket, breaker or robots.
+    result = plan(
+        [
+            Link("https://books.toscrape.com:8080/catalogue/a/", PageKind.DETAIL),
+            Link("https://books.toscrape.com:443/catalogue/b/", PageKind.DETAIL),
+        ]
+    )
+    assert [e.url for e in result] == [BASE + "b/"]

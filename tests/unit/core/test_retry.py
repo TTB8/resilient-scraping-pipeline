@@ -4,6 +4,7 @@ import pytest
 
 from scraping_pipeline.core.classify import Classification
 from scraping_pipeline.core.retry import (
+    RETRY_AFTER_CEILING_S,
     BackoffPolicy,
     RetryAction,
     backoff_delay,
@@ -212,3 +213,46 @@ def test_decide_long_retry_after_stops_even_on_last_attempt() -> None:
 def test_decide_retry_after_ignored_for_server_error() -> None:
     # Retry-After on a plain 500 is informational; only rate_limited honours it.
     assert decide(POLICY, cls(ResponseClass.SERVER_ERROR, 999.0), 1, 0.5).delay_s == 0.5
+
+
+# --- R1-02: no Retry-After value may raise ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("digits", "expected"),
+    [
+        (10, 9_999_999_999.0),  # the longest value still taken literally
+        (11, RETRY_AFTER_CEILING_S),
+        (400, RETRY_AFTER_CEILING_S),  # used to raise OverflowError
+        (5000, RETRY_AFTER_CEILING_S),  # used to raise ValueError (int digit limit)
+    ],
+)
+def test_huge_delta_seconds_are_clamped(digits: int, expected: float) -> None:
+    assert parse_delta_seconds("9" * digits) == expected
+    assert parse_retry_after("9" * digits, 0.0) == expected
+
+
+def test_huge_retry_after_stops_the_domain() -> None:
+    huge = parse_delta_seconds("9" * 400)
+    decision = decide(BackoffPolicy(), cls(ResponseClass.RATE_LIMITED, huge), 1, 0.5)
+    assert decision.action is RetryAction.STOP_DOMAIN
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Wed, 21 Oct 9999999999999999999999 07:28:00 GMT",  # OverflowError inside the parser
+        "Wed, 21 Oct 2015 99999999999999999999:28:00 GMT",
+        "Wed, 21 Oct 99999 07:28:00 GMT",  # ValueError: year out of range
+    ],
+)
+def test_overflowing_http_dates_are_none(value: str) -> None:
+    assert parse_http_date(value) is None
+    assert parse_retry_after(value, 0.0) is None
+
+
+@pytest.mark.parametrize("limit", [RETRY_AFTER_CEILING_S, 1e12])
+def test_policy_rejects_retry_after_limit_at_or_above_ceiling(limit: float) -> None:
+    # Otherwise a clamped huge Retry-After could be waited out instead of stopping the domain.
+    with pytest.raises(ValueError, match="max_retry_after_s"):
+        BackoffPolicy(max_retry_after_s=limit)

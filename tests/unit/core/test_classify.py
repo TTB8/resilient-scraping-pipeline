@@ -126,36 +126,114 @@ def test_429_without_retry_after() -> None:
     assert result.retry_after_s is None
 
 
-# --- markers ---------------------------------------------------------------------------------
+# --- markers: the 2xx rule (R1-05) ----------------------------------------------------------
+
+REAL_BOOK = FIXTURES / "books" / "catalogue" / "sharp-objects_997" / "index.html"
+INTERSTITIAL = """<!doctype html><html><head><title>Verify you are human</title>
+<style>body{font-family:sans-serif}</style><script>window.x = 1;</script></head>
+<body><div class="box"><p>This check runs automatically. Please wait.</p>
+<noscript>Enable JavaScript and cookies to continue</noscript></div></body></html>"""
 
 
-def test_200_challenge_page_is_challenge() -> None:
+def real_book_with(phrase: str, *, title: bool = False) -> str:
+    """The real saved book page with ``phrase`` written into its description (or its title)."""
+    page = REAL_BOOK.read_text(encoding="utf-8")
+    marker = '<div id="product_description" class="sub-header">'
+    start = page.index("<p>", page.index(marker)) + len("<p>")
+    page = page[:start] + f"She asked: {phrase}? " + page[start:]
+    if title:
+        page = page.replace("<title>", f"<title>{phrase} | ", 1)
+        page = page.replace("<h1>Sharp Objects</h1>", f"<h1>{phrase}</h1>", 1)
+    return page
+
+
+def test_real_book_page_is_ok_unmodified() -> None:
+    assert classify(200, {}, REAL_BOOK.read_text(encoding="utf-8"), None).response_class is (
+        ResponseClass.OK
+    )
+
+
+@pytest.mark.parametrize(
+    "phrase", ["are you a robot", "Verify you are human", "access denied", "Request blocked"]
+)
+def test_real_book_blurb_with_marker_is_ok(phrase: str) -> None:
+    # R1-05: this used to stop the books domain (the page is 2291 visible chars, under 3000).
+    page = real_book_with(phrase)
+    assert phrase.casefold() in page.casefold()
+    result = classify(200, {"Content-Type": "text/html"}, page, None)
+    assert result.response_class is ResponseClass.OK, result.reason
+
+
+@pytest.mark.parametrize("phrase", ["Access Denied", "Are You a Robot"])
+def test_real_book_titled_like_a_marker_is_ok(phrase: str) -> None:
+    # The book's own title goes in <title> and <h1>; the page is long, so it is content.
+    page = real_book_with(phrase, title=True)
+    assert f"<h1>{phrase}</h1>" in page
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+
+
+def test_200_interstitial_with_marker_in_title_is_challenge() -> None:
+    result = classify(200, {}, INTERSTITIAL, None)
+    assert result.response_class is ResponseClass.CHALLENGE
+    assert result.reason == "200 page says 'verify you are human'"
+
+
+def test_200_challenge_with_marker_in_h1_is_challenge() -> None:
     result = classify(200, {}, CHALLENGE_PAGE, None)
     assert result.response_class is ResponseClass.CHALLENGE
     assert "checking your browser" in result.reason
-
-
-def test_marker_inside_script_is_ignored() -> None:
-    page = "<html><title>Hi</title><script>'verify you are human'</script><p>hello</p></html>"
-    assert classify(200, {}, page, None).response_class is ResponseClass.OK
-
-
-def test_marker_inside_comment_is_ignored() -> None:
-    page = "<html><title>Hi</title><!-- access denied --><p>hello</p></html>"
-    assert classify(200, {}, page, None).response_class is ResponseClass.OK
 
 
 def test_200_block_page_is_blocked() -> None:
     assert classify(200, {}, BLOCK_PAGE, None).response_class is ResponseClass.BLOCKED
 
 
-def test_markers_are_case_and_whitespace_insensitive() -> None:
-    page = "<p>VERIFY   you\n are&nbsp;HUMAN</p>"
+def test_200_marker_only_in_body_text_is_ok() -> None:
+    page = "<html><title>Hello</title><h1>Welcome</h1><p>Verify you are human.</p></html>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+
+
+def test_200_marker_in_second_h1_is_ignored() -> None:
+    page = "<title>Hi</title><h1>Welcome</h1><h1>Access denied</h1>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+
+
+def test_200_headline_markers_are_case_and_whitespace_insensitive() -> None:
+    page = "<title>VERIFY   you\n are&nbsp;HUMAN</title>"
     assert classify(200, {}, page, None).response_class is ResponseClass.CHALLENGE
+    page = "<h1 class='x'>Access <b>DENIED</b></h1>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.BLOCKED
+
+
+def test_200_long_page_with_marker_title_is_ok() -> None:
+    page = "<title>Access denied</title><p>" + "word " * 300 + "</p>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+    short = BlockMarkers(challenge=(), blocked=("access denied",), short_page_chars=10_000)
+    assert classify(200, {}, page, None, markers=short).response_class is ResponseClass.BLOCKED
+
+
+def test_200_markers_inside_script_or_comment_are_ignored() -> None:
+    page = "<html><script>'<title>verify you are human</title>'</script><title>Hi</title></html>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+    page = "<html><!-- <h1>access denied</h1> --><h1>Hello</h1></html>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+
+
+def test_single_word_robot_never_triggers() -> None:
+    page = "<title>The Robot</title><h1>Robot</h1><p>A robot learns to love. Human, verify.</p>"
+    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+
+
+# --- markers on refusal and overload statuses ------------------------------------------------
 
 
 def test_403_with_challenge_marker_is_challenge() -> None:
     assert classify(403, {}, CHALLENGE_PAGE, None).response_class is ResponseClass.CHALLENGE
+
+
+def test_403_challenge_marker_in_body_text_counts() -> None:
+    page = "<title>Forbidden</title><p>Please verify you are human.</p>"
+    assert classify(403, {}, page, None).response_class is ResponseClass.CHALLENGE
 
 
 def test_403_with_block_marker_stays_blocked() -> None:
@@ -169,31 +247,80 @@ def test_403_long_page_still_scanned_for_challenge() -> None:
     assert classify(403, {}, page, None).response_class is ResponseClass.CHALLENGE
 
 
-def test_single_word_robot_never_triggers() -> None:
-    page = "<title>The Robot</title><p>A robot learns to love. Human, robot, verify.</p>"
-    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+@pytest.mark.parametrize("status", [429, 503])
+def test_overload_status_with_challenge_page_is_challenge(status: int) -> None:
+    result = classify(status, {"Retry-After": "30"}, CHALLENGE_PAGE, None)
+    assert result.response_class is ResponseClass.CHALLENGE
+    assert result.reason == f"{status} challenge: 'checking your browser'"
+    assert result.retry_after_s == 30.0
 
 
-def test_long_2xx_page_with_marker_phrase_is_ok() -> None:
-    # A real content page that happens to say "access denied" in its text or title.
-    page = "<title>Access Denied | A Novel</title><p>" + "story " * 1000 + "</p>"
-    assert classify(200, {}, page, None).response_class is ResponseClass.OK
+@pytest.mark.parametrize(
+    ("status", "headers", "expected"),
+    [
+        (429, {}, ResponseClass.RATE_LIMITED),
+        (503, {}, ResponseClass.SERVER_ERROR),
+        (503, {"Retry-After": "5"}, ResponseClass.RATE_LIMITED),
+    ],
+)
+def test_overload_status_ignores_block_phrases(
+    status: int, headers: dict[str, str], expected: ResponseClass
+) -> None:
+    # "Request blocked" on a 429/503 page describes the overload; only challenges change the class.
+    assert classify(status, headers, BLOCK_PAGE, None).response_class is expected
+
+
+def test_other_5xx_bodies_are_not_scanned() -> None:
+    assert classify(500, {}, CHALLENGE_PAGE, None).response_class is ResponseClass.SERVER_ERROR
+
+
+# --- I-5: the scan window can cut a block open -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "<script>var msg = 'verify you are human';",
+        "<STYLE>/* verify you are human */",
+        "<noscript>verify you are human",
+        "<!-- verify you are human",
+        "<a title='verify you are human",
+    ],
+)
+def test_block_cut_open_by_scan_window_is_not_visible(opener: str) -> None:
+    markers = BlockMarkers(challenge=("verify you are human",), blocked=(), scan_limit_chars=120)
+    page = "<title>Forbidden</title>" + opener + " " + "x" * 200 + "</script></style>-->'>"
+    assert len(page) > markers.scan_limit_chars
+    result = classify(403, {}, page, None, markers=markers)
+    assert result.response_class is ResponseClass.BLOCKED, result.reason
 
 
 def test_scan_limit_bounds_the_search() -> None:
     markers = BlockMarkers(challenge=("verify you are human",), blocked=(), scan_limit_chars=50)
     page = "<p>" + "x" * 100 + " verify you are human</p>"
-    assert classify(200, {}, page, None, markers=markers).response_class is ResponseClass.OK
-    assert classify(200, {}, page, None).response_class is ResponseClass.CHALLENGE
+    assert classify(403, {}, page, None, markers=markers).response_class is ResponseClass.BLOCKED
+    assert classify(403, {}, page, None).response_class is ResponseClass.CHALLENGE
 
 
 def test_custom_markers() -> None:
     markers = BlockMarkers(challenge=("Solve The Puzzle",), blocked=("go away now",))
     assert markers.challenge == ("solve the puzzle",)
-    assert classify(200, {}, "<p>go away now</p>", None, markers=markers).response_class is (
-        ResponseClass.BLOCKED
-    )
+    assert classify(
+        200, {}, "<title>go away now</title>", None, markers=markers
+    ).response_class is (ResponseClass.BLOCKED)
     assert classify(200, {}, BLOCK_PAGE, None, markers=markers).response_class is ResponseClass.OK
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (301, "unexpected 301 without a usable Location"),
+        (308, "unexpected 308 without a usable Location"),
+        (100, "unexpected informational 100"),
+    ],
+)
+def test_unexpected_status_reasons(status: int, reason: str) -> None:
+    assert classify(status, {}, None, None).reason == reason
 
 
 @pytest.mark.parametrize("phrase", ["robot", "  denied  ", ""])

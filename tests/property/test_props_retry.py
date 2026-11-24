@@ -3,8 +3,14 @@
 from hypothesis import given
 from hypothesis import strategies as st
 
-from scraping_pipeline.core.classify import Classification
-from scraping_pipeline.core.retry import BackoffPolicy, RetryAction, backoff_delay, decide
+from scraping_pipeline.core.classify import Classification, classify
+from scraping_pipeline.core.retry import (
+    RETRY_AFTER_CEILING_S,
+    BackoffPolicy,
+    RetryAction,
+    backoff_delay,
+    decide,
+)
 from scraping_pipeline.core.types import ResponseClass
 
 rands = st.floats(min_value=0.0, max_value=1.0, exclude_max=True)
@@ -84,3 +90,30 @@ def test_attempts_never_exceed_max_before_give_up(
             assert decision.action is RetryAction.GIVE_UP_EXHAUSTED
             assert attempt == policy.max_attempts
             break
+
+
+_header_values = st.one_of(
+    st.text(),
+    st.from_regex(r"\d{1,6000}", fullmatch=True),
+    st.from_regex(r"\s*-?\d{1,30}(\.\d{0,5})?\s*", fullmatch=True),
+    st.from_regex(
+        r"(Mon|Wed|Sun), \d{1,25} (Oct|Foo|Nov) \d{1,25} \d{1,25}:\d{1,3}:\d{1,3} (GMT|[+-]\d{4})",
+        fullmatch=True,
+    ),
+)
+
+
+@given(
+    value=_header_values,
+    status=st.sampled_from([200, 403, 429, 500, 503]),
+    now=st.one_of(st.none(), st.floats(min_value=0.0, max_value=4e9)),
+)
+def test_classify_never_raises_on_any_retry_after(
+    value: str, status: int, now: float | None
+) -> None:
+    # R1-02: one bad header must never abort the run.
+    result = classify(status, {"Retry-After": value}, None, None, now_epoch=now)
+    if result.retry_after_s is not None:
+        assert 0.0 <= result.retry_after_s <= RETRY_AFTER_CEILING_S
+    if result.response_class is ResponseClass.RATE_LIMITED:
+        decide(BackoffPolicy(), result, 1, 0.5)  # and the decision cannot raise either
