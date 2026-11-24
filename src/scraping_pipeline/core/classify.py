@@ -12,10 +12,12 @@ Status rules, in order:
   interstitial with 200);
 * 404 / 410 -> ``not_found``;
 * 401 / 403 -> ``blocked``, or ``challenge`` when the body carries a challenge marker;
-* 429 -> ``rate_limited``; 503 with a valid ``Retry-After`` -> ``rate_limited``;
+* 429 / 503 with a challenge marker in the body -> ``challenge`` (interstitials are often served
+  with these statuses); otherwise 429 -> ``rate_limited`` and 503 with a valid ``Retry-After`` ->
+  ``rate_limited``;
 * other 5xx -> ``server_error``; other 4xx -> ``client_error``;
-* 1xx / 3xx -> ``client_error``: the fetcher is expected to follow redirects, so seeing one here is a
-  bug on our side, and retrying it would not help;
+* 1xx / 3xx -> ``client_error``: the scheduler follows same-site redirects itself, so a 3xx that
+  reaches the classifier had no usable ``Location``, and retrying it would not help;
 * a status outside 100-599 -> ``network_error``: the peer is not speaking HTTP correctly, which we
   treat like a broken connection (transient, retried with backoff).
 
@@ -23,13 +25,19 @@ Marker detection is deliberately conservative, because a false positive stops a 
 
 * markers are multi-word phrases (enforced by :class:`BlockMarkers`), so a single word such as
   "robot" in a book description can never trigger them;
-* only the first ``scan_limit_chars`` characters of the body are scanned, and only the ``<title>`` and
-  the visible text (scripts, styles and tags are stripped), so the cost is bounded per response;
-* on a 2xx page, markers count only when the page is short (under ``short_page_chars`` visible
-  characters), title included. Interstitials are short; real content pages are not, and a book
-  titled "Access Denied" or a blurb quoting "are you a robot" must not stop the crawl. On 401/403 the
-  status already says "refused", so the whole scanned text is searched, only to tell ``challenge``
-  from ``blocked``.
+* only the first ``scan_limit_chars`` characters of the body are scanned, so the cost is bounded
+  per response. Comments, ``<script>``, ``<style>`` and ``<noscript>`` are removed first, including
+  one that the scan window cuts open (its unterminated tail is dropped, not read as visible text);
+* on a **2xx** page a marker needs two signals: it must appear in the ``<title>`` or the first
+  ``<h1>`` (never in the body text), *and* the page must be short (under ``short_page_chars``
+  visible characters, 1200 by default). Body text is excluded because a book blurb quoting "are
+  you a robot" is content. The length test is needed too, because on the books site the ``<h1>``
+  *is* the book's title, and a book can be called "Access Denied". The default comes from the saved
+  practice pages: real pages carry 1374-4045 visible characters (the JS quotes shells carry about
+  100, but their title and ``<h1>`` are fixed), while interstitials carry a few hundred;
+* on **401 / 403 / 429 / 503** the status already says something is wrong, so all the visible
+  text is searched: on 401/403 only to tell ``challenge`` from ``blocked``, on 429/503 only for
+  challenge phrases.
 
 This module only *detects*. The project never tries to get past a block or a challenge: it records
 the reason and stops the domain (ADR 0005).
@@ -68,7 +76,7 @@ class BlockMarkers:
     challenge: tuple[str, ...]
     blocked: tuple[str, ...]
     scan_limit_chars: int = 64 * 1024
-    short_page_chars: int = 3000
+    short_page_chars: int = 1200
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "challenge", _normalize_phrases(self.challenge, "challenge"))
@@ -125,15 +133,20 @@ class Classification:
     reason: str
 
 
-_SCRIPT_OR_STYLE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1\s*>", re.I | re.S)
-_TITLE = re.compile(r"<title\b[^>]*>(.*?)</title\s*>", re.I | re.S)
 _COMMENT = re.compile(r"<!--.*?-->", re.S)
-_TAG = re.compile(r"<[^>]*>")
+_SCRIPT_OR_STYLE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1\s*>", re.I | re.S)
+# What is left open when the scan window cuts a comment or a script/style block in half.
+_UNTERMINATED = re.compile(r"<!--.*\Z|<(?:script|style|noscript)\b.*\Z", re.I | re.S)
+_TITLE = re.compile(r"<title\b[^>]*>(.*?)</title\s*>", re.I | re.S)
+_H1 = re.compile(r"<h1\b[^>]*>(.*?)</h1\s*>", re.I | re.S)
+_TAG = re.compile(r"<[^>]*>?")
 _ENTITIES = {"&nbsp;": " ", "&amp;": "&", "&#39;": "'", "&apos;": "'", "&quot;": '"'}
 
 _MIN_STATUS, _MAX_STATUS = 100, 599
 _NOT_FOUND = frozenset({HTTPStatus.NOT_FOUND, HTTPStatus.GONE})
 _DENIED = frozenset({HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN})
+_UNAVAILABLE = frozenset({HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE})
+_INFORMATIONAL = 1
 
 
 def classify(
@@ -183,10 +196,11 @@ def _classify_status(
         return _classify_success(status, body, markers)
     if status in _NOT_FOUND:
         return ResponseClass.NOT_FOUND, f"{status} not found"
-    if status in _DENIED:
-        hit = _find_marker(body, markers, short_pages_only=False)
-        if hit is not None and hit[0] is ResponseClass.CHALLENGE:
+    if status in _DENIED or status in _UNAVAILABLE:
+        hit = _find_marker(body, markers, headline_only=False, blocked_too=False)
+        if hit is not None:
             return ResponseClass.CHALLENGE, f"{status} challenge: {hit[1]!r}"
+    if status in _DENIED:
         return ResponseClass.BLOCKED, f"{status} access refused"
     if status == HTTPStatus.TOO_MANY_REQUESTS or (
         status == HTTPStatus.SERVICE_UNAVAILABLE and _is_valid_retry_after(raw_retry_after)
@@ -198,7 +212,7 @@ def _classify_status(
 def _classify_success(
     status: int, body: str | None, markers: BlockMarkers
 ) -> tuple[ResponseClass, str]:
-    hit = _find_marker(body, markers, short_pages_only=True)
+    hit = _find_marker(body, markers, headline_only=True, blocked_too=True)
     if hit is not None:
         return hit[0], f"{status} page says {hit[1]!r}"
     return ResponseClass.OK, f"{status}"
@@ -210,7 +224,9 @@ def _classify_other(status: int) -> tuple[ResponseClass, str]:
         return ResponseClass.SERVER_ERROR, f"{status} server error"
     if family == 4:  # noqa: PLR2004
         return ResponseClass.CLIENT_ERROR, f"{status} client error"
-    return ResponseClass.CLIENT_ERROR, f"unexpected {status} (redirects are not followed)"
+    if family == _INFORMATIONAL:
+        return ResponseClass.CLIENT_ERROR, f"unexpected informational {status}"
+    return ResponseClass.CLIENT_ERROR, f"unexpected {status} without a usable Location"
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -231,25 +247,46 @@ def _rate_reason(retry_after: float | None) -> str:
 
 
 def _find_marker(
-    body: str | None, markers: BlockMarkers, *, short_pages_only: bool
+    body: str | None, markers: BlockMarkers, *, headline_only: bool, blocked_too: bool
 ) -> tuple[ResponseClass, str] | None:
-    """Return the first matching marker, challenge phrases before blocked ones."""
+    """Return the first matching marker, challenge phrases before blocked ones.
+
+    ``headline_only`` is the 2xx rule: search the ``<title>`` and first ``<h1>``, and only on a
+    short page. Otherwise all visible text is searched. ``blocked_too=False`` ignores block phrases.
+    """
     if not body:
         return None
-    head = body[: markers.scan_limit_chars]
-    title_match = _TITLE.search(head)
-    title = _normalize_text(title_match.group(1)) if title_match else ""
-    visible = _normalize_text(_TAG.sub(" ", _COMMENT.sub(" ", _SCRIPT_OR_STYLE.sub(" ", head))))
-    if short_pages_only and len(visible) >= markers.short_page_chars:
-        return None
-    for response_class, phrases in (
-        (ResponseClass.CHALLENGE, markers.challenge),
-        (ResponseClass.BLOCKED, markers.blocked),
-    ):
+    html = _strip_invisible(body[: markers.scan_limit_chars])
+    visible = _visible_text(html)
+    if headline_only:
+        if len(visible) >= markers.short_page_chars:
+            return None
+        haystacks = [_first_text(_TITLE, html), _first_text(_H1, html)]
+    else:
+        haystacks = [visible]
+    groups = [(ResponseClass.CHALLENGE, markers.challenge)]
+    if blocked_too:
+        groups.append((ResponseClass.BLOCKED, markers.blocked))
+    for response_class, phrases in groups:
         for phrase in phrases:
-            if phrase in title or phrase in visible:
+            if any(phrase in text for text in haystacks):
                 return response_class, phrase
     return None
+
+
+def _strip_invisible(html: str) -> str:
+    """Drop comments and script/style/noscript blocks, then anything the scan window left open."""
+    html = _SCRIPT_OR_STYLE.sub(" ", _COMMENT.sub(" ", html))
+    return _UNTERMINATED.sub(" ", html)
+
+
+def _visible_text(html: str) -> str:
+    return _normalize_text(_TAG.sub(" ", html))
+
+
+def _first_text(pattern: re.Pattern[str], html: str) -> str:
+    match = pattern.search(html)
+    return _visible_text(match.group(1)) if match else ""
 
 
 def _normalize_text(text: str) -> str:
