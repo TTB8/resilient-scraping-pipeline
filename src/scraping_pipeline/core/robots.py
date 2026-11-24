@@ -24,9 +24,9 @@ Status handling (section 2.3.1), with the two places where we are stricter than 
   and if it never answers, stops the domain (its entries become ``stopped``, which a later run can
   reset), rather than recording the URLs as disallowed;
 * 5xx or unreachable (``status is None``): disallow everything (section 2.3.1.4);
-* anything else (1xx, 3xx, out of range): disallow everything. The fetcher must follow up to five
-  redirects itself (section 2.3.1.2); a raw 3xx here means it did not, and not knowing the rules is
-  not permission.
+* anything else (1xx, 3xx, out of range): disallow everything. The scheduler follows up to five
+  same-host redirects itself (section 2.3.1.2, ADR 0009); a raw 3xx here means the chain was
+  refused or never ended, and not knowing the rules is not permission.
 
 Other choices:
 
