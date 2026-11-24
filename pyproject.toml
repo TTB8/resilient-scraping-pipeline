@@ -57,6 +57,8 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# A stuck real-time test (a scheduler that never finishes) fails after 60s instead of hanging CI.
+timeout = 60
 markers = ["browser: needs Playwright Chromium installed"]
 
 [tool.coverage.run]
@@ -75,5 +77,6 @@ dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.5.0",
     "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.17.6",
 ]

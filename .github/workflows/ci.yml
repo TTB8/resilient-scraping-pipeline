@@ -49,6 +49,9 @@ jobs:
       - name: Install Chromium for the JS-rendered site test
         run: uv run playwright install --with-deps chromium
       - name: pytest (all tests, including browser)
+        env:
+          # Fail, don't skip, if Chromium can't launch: a broken install must not hide the JS tests.
+          REQUIRE_BROWSER_TESTS: '1'
         run: uv run pytest --cov --cov-report=term --cov-report=xml
       - name: Core coverage gate (>= 90%)
         run: uv run coverage report --include='src/scraping_pipeline/core/*' --fail-under=90
