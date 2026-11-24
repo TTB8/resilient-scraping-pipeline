@@ -19,7 +19,10 @@ Status handling (section 2.3.1), with the two places where we are stricter than 
 
 * 2xx: parse the body (an empty body allows everything);
 * 4xx: "unavailable", so everything is allowed. **Except 429**: we treat "too many requests" for
-  robots.txt like a server error and allow nothing, because the site is telling us to back off;
+  robots.txt like a server error and allow nothing, because the site is telling us to back off.
+  This policy is only the verdict for one answer: the scheduler retries robots.txt with backoff,
+  and if it never answers, stops the domain (its entries become ``stopped``, which a later run can
+  reset), rather than recording the URLs as disallowed;
 * 5xx or unreachable (``status is None``): disallow everything (section 2.3.1.4);
 * anything else (1xx, 3xx, out of range): disallow everything. The fetcher must follow up to five
   redirects itself (section 2.3.1.2); a raw 3xx here means it did not, and not knowing the rules is
@@ -98,7 +101,9 @@ class RobotsPolicy:
         if family == 2:  # noqa: PLR2004 - HTTP status families
             return cls.parse(body or "", reason=f"robots.txt {status}: parsed")
         if status == HTTPStatus.TOO_MANY_REQUESTS:
-            return cls(RobotsMode.DISALLOW_ALL, (), "robots.txt 429: disallow all until it answers")
+            return cls(
+                RobotsMode.DISALLOW_ALL, (), "robots.txt 429: too many requests, disallow all"
+            )
         if family == 4:  # noqa: PLR2004
             return cls(RobotsMode.ALLOW_ALL, (), f"robots.txt {status}: unavailable, allow all")
         if family == 5:  # noqa: PLR2004

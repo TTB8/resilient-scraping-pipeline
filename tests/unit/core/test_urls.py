@@ -119,7 +119,28 @@ def test_invalid_ipv6_is_rejected_by_domain_and_same_site() -> None:
         domain("http://[::1/")
     assert not same_site("http://[::1/", "http://[::1]/")
     assert domain("http://[::1]:8080/") == "::1"
-    assert same_site("http://[::1]:8080/a", "http://[::1]/")
+    assert same_site("http://[::1]:8080/a", "http://[::1]:8080/")
+    assert not same_site("http://[::1]:8080/a", "http://[::1]/")
+
+
+@pytest.mark.parametrize(
+    ("url", "origin", "expected"),
+    [
+        ("https://x.test:8080/a", "https://x.test/", False),  # another port is another server
+        ("http://x.test:8080/a", "http://x.test:80/", False),
+        ("https://x.test:443/a", "https://x.test/", True),  # explicit default port
+        ("https://x.test/a", "https://x.test:443/", True),
+        ("http://x.test:80/a", "http://x.test/", True),
+        ("http://x.test:443/a", "https://x.test/", False),  # scheme still counts
+        ("https://x.test:8443/a", "https://x.test:8443/b", True),
+        ("https://B\u00dcCHER.example/", "https://xn--bcher-kva.example/", True),
+        ("https://x.test:99999/", "https://x.test/", False),  # unparseable port: fail closed
+        ("/relative", "/relative", False),  # no host: fail closed
+        ("https://\u00e9..b/", "https://\u00e9..b/", False),  # invalid IDNA host
+    ],
+)
+def test_same_site_compares_effective_port(url: str, origin: str, expected: bool) -> None:
+    assert same_site(url, origin) is expected
 
 
 def test_resolve_keeps_ipv6_and_double_slash() -> None:

@@ -103,16 +103,30 @@ def domain(url: str) -> str:
 
 
 def same_site(url: str, origin: str) -> bool:
-    """True when ``url`` is on the same scheme and host as ``origin``.
+    """True when ``url`` has the same origin as ``origin``: scheme, host and effective port.
 
-    This is the confinement rule the frontier applies to discovered links.
+    This is the confinement rule the frontier applies to discovered links, and it matches how the
+    scheduler confines redirects. The port counts because another port on the same host is another
+    server: it must not borrow this site's rate limit, breaker or robots.txt. Default ports are
+    normalized (``https://h/`` and ``https://h:443/`` are one origin; ``https://h:8443/`` is not),
+    hosts compare case-insensitively and IDNA-encoded, and an unparseable or host-less URL is never
+    same-site (fail closed).
     """
+    a, b = _origin(url), _origin(origin)
+    return a is not None and a == b
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
     try:
-        a, b = urlsplit(url), urlsplit(origin)
-        host_a, host_b = a.hostname, b.hostname
-    except ValueError:
-        return False
-    return a.scheme.lower() == b.scheme.lower() and (host_a or "").lower() == (host_b or "").lower()
+        parts = urlsplit(url.strip())
+        port = parts.port
+        if not parts.hostname:
+            return None
+        host = _canonical_host(parts.hostname, url)
+    except ValueError:  # bad port, bad brackets, or InvalidUrlError from a bad IDNA host
+        return None
+    scheme = parts.scheme.lower()
+    return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme)
 
 
 def normalize_percent_encoding(text: str) -> str:
