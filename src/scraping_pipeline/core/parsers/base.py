@@ -141,7 +141,5 @@ def text_of(node: LexborNode | None) -> str | None:
     return value or None
 
 
-def attr(node: LexborNode | None, name: str) -> str | None:
-    if node is None:
-        return None
+def attr(node: LexborNode, name: str) -> str | None:
     return node.attributes.get(name)

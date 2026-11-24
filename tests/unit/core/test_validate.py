@@ -284,6 +284,8 @@ def test_quarantined_row_is_json_ready() -> None:
         ("bio", "missing"),
         ("born_date", "date_type"),
     ]
+    dated = validate(QuotesDataset(quotes=(), authors=(author("A", bio=None),)))
+    assert dated.quarantined[0].to_dict()["draft"]["born_date"] == "1900-01-01"
     zero = validate(books_ds(book(1, price_gbp=Decimal("0")))).quarantined[0].to_dict()
     assert zero["draft"]["price_gbp"] == "0"
     assert validate(
