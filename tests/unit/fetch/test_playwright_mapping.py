@@ -118,6 +118,7 @@ def test_launch_options_force_no_proxy() -> None:
 
 def test_refusal_check_uses_the_given_markers() -> None:
     custom = BlockMarkers(challenge=("please hold the line",), blocked=("go away now",))
-    page = "<html><body><p>Please hold the line</p></body></html>"
+    # On a 2xx, markers count only in the <title> / first <h1> of a short page (core.classify, R1-05).
+    page = "<html><head><title>Please hold the line</title></head><body><p>...</p></body></html>"
     assert is_refusal_page(200, {}, page, custom)
     assert not is_refusal_page(200, {}, page)  # the defaults do not know this phrase
