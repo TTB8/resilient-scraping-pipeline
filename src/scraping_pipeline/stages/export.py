@@ -39,6 +39,11 @@ referential checks then fail by construction.
 report is the exception, on purpose: it says *when* the pipeline ran (``started_at``,
 ``finished_at``, ``duration_s``), so it is excluded from the determinism guarantee.
 
+Request counts: ``http_requests`` is what the **latest** fetch run sent; the page counts are
+cumulative over the frontier, so after a repeated or resumed crawl the report also gives
+``http_requests_total``, summed over the fetch runs whose pages were parsed (``fetch_run_ids``,
+from ``parse_stats.json``), and lists those runs.
+
 Report times: ``started_at`` is the caller's (``pipeline run`` passes its own start) or else the
 start of the latest fetch run, ``finished_at`` is now. Page counts come from the frontier:
 ``discovered`` is every entry, ``fetched`` the ``done`` ones, and a final failed entry is counted
@@ -260,12 +265,27 @@ def _domain_stops(store: StateStore, site: Site) -> tuple[DomainStop, ...]:
     )
 
 
-def _last_fetch_requests(fetch_runs: list[RunRecord]) -> int | None:
-    """Requests sent by the most recent fetch run, from its summary (None if it never reported)."""
-    if not fetch_runs or fetch_runs[-1].summary_json is None:
+def _requests_of(run: RunRecord) -> int | None:
+    """Requests a fetch run sent, from its summary (None if it never reported a count)."""
+    if run.summary_json is None:
         return None
-    requests = json.loads(fetch_runs[-1].summary_json).get("requests")
+    requests = json.loads(run.summary_json).get("requests")
     return requests if isinstance(requests, int) else None
+
+
+def _request_counts(
+    fetch_runs: list[RunRecord], fetch_run_ids: tuple[str, ...]
+) -> dict[str, int | None]:
+    """``http_requests`` (latest run) and the total over the runs behind the parsed pages."""
+    latest = _requests_of(fetch_runs[-1]) if fetch_runs else None
+    by_id = {run.run_id: run for run in fetch_runs}
+    counts = [_requests_of(by_id[r]) if r in by_id else None for r in fetch_run_ids]
+    known = [c for c in counts if c is not None]
+    return {
+        "http_requests": latest,
+        "http_requests_total": sum(known) if fetch_run_ids else None,
+        "http_requests_unreported_runs": len(counts) - len(known),
+    }
 
 
 def _build_report(
@@ -281,15 +301,17 @@ def _build_report(
     finished = datetime.now(UTC)
     started_at = started_at or (fetch_runs[-1].started_at if fetch_runs else finished.isoformat())
     duration = max(0.0, (finished - datetime.fromisoformat(started_at)).total_seconds())
+    fetch_run_ids = tuple(sorted(stats.get("fetch_run_ids") or ()))
     return RunReport(
         site=site,
         fetch_run_id=fetch_run_id,
+        fetch_run_ids=fetch_run_ids,
         parse_run_id=stats["parse_run_id"],
         started_at=started_at,
         finished_at=finished.isoformat(),
         duration_s=duration,
         pages=_page_counts(store, site).model_copy(
-            update={"http_requests": _last_fetch_requests(fetch_runs)}
+            update=_request_counts(fetch_runs, fetch_run_ids)
         ),
         domains_stopped=_domain_stops(store, site),
         parse=ParseCoverage(

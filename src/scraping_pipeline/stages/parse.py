@@ -28,7 +28,8 @@ Outputs, under ``<data_dir>/<site>/parsed/``:
 * ``records.jsonl``: one ``{"record_type", "draft", "lineage"}`` per draft, decimals and dates
   tagged so validation sees exactly the types the parser produced;
 * ``context.json``: what dataset-level validation needs from the seed pages (the books category set);
-* ``parse_stats.json``: ids, counts, coverage inputs and every parser warning with its URL.
+* ``parse_stats.json``: ids (including ``fetch_run_ids``, the distinct fetch runs of the pages
+  read, which the run report uses), counts, coverage inputs and every parser warning with its URL.
 
 A page whose cache object is corrupt is skipped and listed under ``unreadable`` in the stats (the
 manifest still names it, so the run id stays honest about which cache it read).
@@ -87,6 +88,7 @@ def run_parse(settings: Settings, site: Site) -> ParseStageResult:
         warnings: list[dict[str, str]] = []
         unreadable: list[str] = []
         records_by_type: dict[str, int] = {}
+        fetch_run_ids: set[str] = set()
         pages = item_pages = item_pages_with_records = 0
         for entry in frontier:
             if not cache.has(entry.url):
@@ -97,6 +99,7 @@ def run_parse(settings: Settings, site: Site) -> ParseStageResult:
                 continue
             cache_entry, html = cached
             pages += 1
+            fetch_run_ids.add(cache_entry.fetch_run_id)
             result = spec.parse(entry.url, html, entry.kind)
             lineage = Lineage(
                 source_url=entry.url,
@@ -131,6 +134,7 @@ def run_parse(settings: Settings, site: Site) -> ParseStageResult:
             "site": site.value,
             "parse_run_id": parse_run_id,
             "manifest_sha256": manifest,
+            "fetch_run_ids": sorted(fetch_run_ids),
             "parser_version": spec.parser_version,
             "contract_version": spec.contract_version,
             "pages_parsed": pages,

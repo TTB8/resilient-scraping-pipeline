@@ -55,7 +55,7 @@ GOLDEN_FULL = """\
 
 | | |
 |---|---|
-| Fetch run | `fetch-20261124` |
+| Latest fetch run | `fetch-20261124` |
 | Parse run | `9cf173d472b1ea7b` |
 | Started | 2026-11-24T10:00:00Z |
 | Finished | 2026-11-24T10:35:12Z |
@@ -113,7 +113,7 @@ GOLDEN_EMPTY = """\
 
 | | |
 |---|---|
-| Fetch run | `f` |
+| Latest fetch run | `f` |
 | Parse run | `n/a` |
 | Started | a |
 | Finished | b |
@@ -207,7 +207,31 @@ def test_optional_sections_are_absent_unless_set() -> None:
 def test_http_requests_line_counts_requests_not_pages() -> None:
     pages = FULL.pages.model_copy(update={"http_requests": 1061})
     shown = render_markdown(FULL.model_copy(update={"pages": pages}))
-    assert "- HTTP requests (robots.txt and redirect hops included): 1061\n" in shown
+    assert "- HTTP requests, latest fetch run (robots.txt and redirect hops included): 1061\n" in (
+        shown
+    )
+    assert "all fetch runs" not in shown
+
+
+def test_cumulative_requests_and_the_fetch_runs_behind_the_pages() -> None:
+    """R2-11: after a re-run the latest run may have sent nothing; say so, and give the total."""
+    pages = FULL.pages.model_copy(update={"http_requests": 0, "http_requests_total": 1061})
+    shown = render_markdown(
+        FULL.model_copy(update={"pages": pages, "fetch_run_ids": ("fetch-b", "fetch-a")})
+    )
+    assert (
+        "| Latest fetch run | `fetch-20261124` |\n| Pages fetched by | `fetch-a`, `fetch-b` |\n"
+        in (shown)
+    )
+    assert "- HTTP requests, latest fetch run (robots.txt and redirect hops included): 0\n" in shown
+    assert "- HTTP requests, all fetch runs behind these pages: 1061\n" in shown
+
+    partial = pages.model_copy(update={"http_requests_unreported_runs": 1})
+    shown = render_markdown(FULL.model_copy(update={"pages": partial}))
+    assert (
+        "- HTTP requests, all fetch runs behind these pages: at least 1061 "
+        "(1 fetch runs reported no count)\n"
+    ) in shown
 
 
 def test_deliverables_section_lists_files_sorted() -> None:

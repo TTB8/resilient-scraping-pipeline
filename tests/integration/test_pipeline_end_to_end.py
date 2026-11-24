@@ -104,6 +104,42 @@ def test_books_end_to_end(
 
 
 @pytest.mark.slow
+def test_a_second_run_reports_its_own_requests_and_the_cumulative_total(
+    pipeline: Callable[..., Result],
+    make_fixture_server: Callable[..., FixtureServer],
+    tmp_path: Path,
+) -> None:
+    """R2-11: run twice. The second run fetches nothing, and the report must not read as
+    "8 pages fetched with 0 requests" with a fetch run id no row carries."""
+    server = make_fixture_server("books")
+    first = pipeline(server, "run", "--site", "books")
+    assert first.exit_code == 0, first.stderr
+    report_path = _output(tmp_path, "books") / "run_report.json"
+    one = json.loads(report_path.read_text())
+    sent = sum(server.hit_counts().values())
+    assert one["pages"]["http_requests"] == one["pages"]["http_requests_total"] == sent
+    assert one["fetch_run_ids"] == [one["fetch_run_id"]]
+
+    second = pipeline(server, "run", "--site", "books")
+    assert second.exit_code == 0, second.stderr
+    two = json.loads(report_path.read_text())
+    assert sum(server.hit_counts().values()) == sent  # nothing new was requested
+    assert two["pages"]["fetched"] == one["pages"]["fetched"] == 8
+    assert two["pages"]["http_requests"] == 0  # the latest fetch run, labelled as such
+    assert two["pages"]["http_requests_total"] == sent  # cumulative, comparable with fetched
+    assert two["pages"]["http_requests_unreported_runs"] == 0
+    assert two["fetch_run_id"] != one["fetch_run_id"]
+    assert two["fetch_run_ids"] == [one["fetch_run_id"]]  # the run every row carries
+    books = pq.read_table(_output(tmp_path, "books") / "books.parquet").to_pylist()
+    assert {b["fetch_run_id"] for b in books} == set(two["fetch_run_ids"])
+    assert "- HTTP requests, latest fetch run (robots.txt and redirect hops included): 0" in (
+        second.stdout
+    )
+    assert f"- HTTP requests, all fetch runs behind these pages: {sent}" in second.stdout
+    assert f"| Pages fetched by | `{one['fetch_run_id']}` |" in second.stdout
+
+
+@pytest.mark.slow
 def test_quotes_end_to_end(
     pipeline: Callable[..., Result],
     make_fixture_server: Callable[..., FixtureServer],

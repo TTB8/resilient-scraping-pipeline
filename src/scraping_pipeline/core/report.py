@@ -34,8 +34,16 @@ class PageCounts(BaseModel):
     failed_by_class: dict[ResponseClass, Count] = Field(default_factory=dict)
     """Final failed pages by the response class that ended them (``ok`` never appears here)."""
     http_requests: Count | None = None
-    """HTTP requests the last fetch run sent, robots.txt and redirect hops included. Pages and
-    requests differ on purpose: the politeness bound is about requests (ADR 0009)."""
+    """HTTP requests the **latest** fetch run sent, robots.txt and redirect hops included. Pages
+    and requests differ on purpose: the politeness bound is about requests (ADR 0009). The page
+    counts above are cumulative over the frontier, so after a re-run (which fetches nothing new)
+    this can be 0 next to many fetched pages; ``http_requests_total`` is the cumulative figure."""
+    http_requests_total: Count | None = None
+    """HTTP requests summed over every fetch run that produced the parsed pages
+    (``RunReport.fetch_run_ids``), so it is comparable with ``fetched``."""
+    http_requests_unreported_runs: Count = 0
+    """How many of those fetch runs recorded no request count (interrupted before reporting): when
+    non-zero, ``http_requests_total`` is a lower bound."""
 
     @property
     def failed(self) -> int:
@@ -119,6 +127,11 @@ class RunReport(BaseModel):
 
     site: Site
     fetch_run_id: str
+    """The latest fetch run of the site (the one ``pipeline run`` just did)."""
+    fetch_run_ids: tuple[str, ...] = ()
+    """The distinct fetch runs whose pages were parsed (the ``fetch_run_id`` values on the rows),
+    sorted. After a resumed or repeated crawl there are several, and the latest may be none of
+    them."""
     parse_run_id: str | None = None
     started_at: str
     finished_at: str
@@ -137,7 +150,12 @@ def render_markdown(report: RunReport) -> str:
         "",
         "| | |",
         "|---|---|",
-        f"| Fetch run | `{report.fetch_run_id}` |",
+        f"| Latest fetch run | `{report.fetch_run_id}` |",
+        *(
+            [f"| Pages fetched by | {', '.join(f'`{r}`' for r in sorted(report.fetch_run_ids))} |"]
+            if report.fetch_run_ids
+            else []
+        ),
         f"| Parse run | `{report.parse_run_id or 'n/a'}` |",
         f"| Started | {report.started_at} |",
         f"| Finished | {report.finished_at} |",
@@ -165,8 +183,17 @@ def _pages(pages: PageCounts) -> list[str]:
     ]
     if pages.http_requests is not None:
         lines.append(
-            f"- HTTP requests (robots.txt and redirect hops included): {pages.http_requests}"
+            "- HTTP requests, latest fetch run (robots.txt and redirect hops included): "
+            f"{pages.http_requests}"
         )
+    if pages.http_requests_total is not None:
+        total = f"{pages.http_requests_total}"
+        if pages.http_requests_unreported_runs:
+            total = (
+                f"at least {total} ({pages.http_requests_unreported_runs} fetch runs "
+                "reported no count)"
+            )
+        lines.append(f"- HTTP requests, all fetch runs behind these pages: {total}")
     if pages.failed_by_class:
         lines += ["", "| Response class | Pages |", "|---|---:|"]
         lines += [
