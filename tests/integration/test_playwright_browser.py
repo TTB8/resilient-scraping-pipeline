@@ -4,6 +4,8 @@ Marked ``browser``: the fast harness check deselects these, CI runs them. They s
 error as the reason) where Chromium cannot start, unless ``REQUIRE_BROWSER_TESTS=1``.
 """
 
+from collections.abc import Callable
+
 import pytest
 
 from fetch_support import make_settings
@@ -31,20 +33,28 @@ async def test_js_rendered_quotes_appear(fixture_server: FixtureServer) -> None:
     assert {hit.user_agent for hit in fixture_server.log()} == {UA}
 
 
-async def test_missing_selector_is_a_timeout(fixture_server: FixtureServer) -> None:
-    settings = make_settings(user_agent=UA, request_timeout_s=1.0)
+async def test_missing_selector_is_a_timeout_with_the_200_and_body_kept(
+    fixture_server: FixtureServer,
+) -> None:
+    # The selector wait gets what is left of the deadline (R2-02), so the navigation's 200 and the
+    # rendered page survive; only the error says the content never appeared.
+    settings = make_settings(user_agent=UA, request_timeout_s=3.0)
     async with PlaywrightFetcher(settings, wait_for_selector=".never-there") as fetcher:
         result = await fetcher.fetch(fixture_server.url("/_js/quotes.html"))
     assert result.error is TransportError.TIMEOUT
     assert result.status == 200
+    assert b'class="quote"' in result.body  # rendered by the page's script, kept for debugging
+    assert result.final_url == fixture_server.url("/_js/quotes.html")
 
 
 async def test_challenge_page_is_returned_for_classification(fixture_server: FixtureServer) -> None:
     fixture_server.scenario(Phase.challenge())
-    settings = make_settings(user_agent=UA, request_timeout_s=1.0)
+    settings = make_settings(user_agent=UA, request_timeout_s=2.0)
     async with PlaywrightFetcher(settings, wait_for_selector=".quote") as fetcher:
         result = await fetcher.fetch(fixture_server.url("/"))
-    assert result.error is None
+    assert result.error is None  # a refusal, not a timeout to retry
+    assert result.status == 200
+    assert result.body
     verdict = classify(result.status, result.headers, result.text(), result.error)
     assert verdict.response_class is ResponseClass.CHALLENGE
 
@@ -77,7 +87,24 @@ async def test_redirect_is_reported_not_followed(fixture_server: FixtureServer) 
     assert result.status == 301
     assert result.headers["location"] == "/_js/quotes.html"
     assert result.error is None
+    assert result.final_url == fixture_server.url("/old")
+    assert fixture_server.hits("/old") == 1
     assert fixture_server.hits("/_js/quotes.html") == 0  # the scheduler decides about the hop
+
+
+async def test_redirect_to_another_origin_never_reaches_it(
+    fixture_server: FixtureServer, make_fixture_server: Callable[..., FixtureServer]
+) -> None:
+    other = make_fixture_server("quotes")  # another port on 127.0.0.1: another origin
+    target = other.url("/_js/quotes.html")
+    fixture_server.redirect("/old", target)
+    async with PlaywrightFetcher(make_settings(user_agent=UA, request_timeout_s=5.0)) as fetcher:
+        result = await fetcher.fetch(fixture_server.url("/old"))
+    assert result.status == 302
+    assert result.headers["location"] == target
+    assert result.error is None
+    assert result.final_url == fixture_server.url("/old")
+    assert other.hits() == 0  # Chromium did not follow it on its own
 
 
 async def test_only_the_document_and_same_origin_scripts_are_requested(

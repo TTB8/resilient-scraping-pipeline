@@ -4,9 +4,11 @@ A token bucket allows short bursts (up to ``burst`` tokens) and then exactly ``r
 average. Over *any* time window of length ``T`` it grants at most ``burst + rate_per_s * T`` tokens,
 which is the guarantee that matters for a polite crawler, and the property the tests check. It
 bounds *requests* because the scheduler takes one token per HTTP request it sends: every redirect
-hop and every robots.txt attempt included (the fetchers never follow redirects on their own). The
-one documented exception is a rendered page's same-origin scripts in the Playwright fetcher, which
-ride on the document's token (see ``fetch/playwright_fetcher.py``).
+hop and every robots.txt attempt included. Neither fetcher follows a redirect on its own: httpx runs
+with ``follow_redirects=False``, and the Playwright fetcher sends the document itself with
+``max_redirects=0`` instead of letting Chromium follow it. The one documented exception is a
+rendered page's same-origin scripts in the Playwright fetcher, which ride on the document's token
+and are downloaded again for every page (see ``fetch/playwright_fetcher.py``).
 
 Three adjustments sit on top:
 

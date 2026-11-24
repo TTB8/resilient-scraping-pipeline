@@ -26,6 +26,13 @@ from scraping_pipeline.fetch.playwright_fetcher import (
         ("net::ERR_TIMED_OUT", TransportError.TIMEOUT),
         ("Timeout 20000ms exceeded.", TransportError.TIMEOUT),
         ("net::ERR_ABORTED; maybe frame was detached?", TransportError.PROTOCOL),
+        # The document goes through route.fetch, so its failures carry Node's error names.
+        ("route.fetch: connect ECONNREFUSED 127.0.0.1:9", TransportError.CONNECT),
+        ("route.fetch: getaddrinfo ENOTFOUND x.test", TransportError.DNS),
+        ("route.fetch: read ECONNRESET", TransportError.RESET),
+        ("route.fetch: socket hang up", TransportError.RESET),
+        ("route.fetch: self-signed certificate", TransportError.TLS),
+        ("route.fetch: Timeout 900ms exceeded.", TransportError.TIMEOUT),
     ],
 )
 def test_navigation_errors_map(message: str, expected: TransportError) -> None:
@@ -61,22 +68,13 @@ def verdict(url: str, kind: str = "document", **flags: bool) -> RouteVerdict:
         request_url=url,
         resource_type=kind,
         is_main_navigation=flags.get("main", False),
-        is_redirect=flags.get("redirect", False),
         document_seen=flags.get("seen", False),
     )
 
 
 def test_the_page_itself_loads_once() -> None:
-    assert verdict(TARGET, main=True) is RouteVerdict.CONTINUE
+    assert verdict(TARGET, main=True) is RouteVerdict.ALLOW
     assert verdict(TARGET, main=True, seen=True) is RouteVerdict.ABORT  # script navigating again
-
-
-def test_redirects_are_reported_not_followed() -> None:
-    same = "https://quotes.example.test/elsewhere/"
-    assert verdict(same, main=True, redirect=True) is RouteVerdict.REPORT_REDIRECT
-    assert verdict("http://169.254.169.254/", main=True, redirect=True) is (
-        RouteVerdict.REPORT_REDIRECT
-    )
 
 
 def test_navigation_to_another_origin_is_aborted() -> None:
@@ -87,7 +85,7 @@ def test_navigation_to_another_origin_is_aborted() -> None:
 @pytest.mark.parametrize(
     ("url", "kind", "expected"),
     [
-        ("https://quotes.example.test/static/jquery.js", "script", RouteVerdict.CONTINUE),
+        ("https://quotes.example.test/static/jquery.js", "script", RouteVerdict.ALLOW),
         ("https://cdn.other.test/lib.js", "script", RouteVerdict.ABORT),
         ("https://quotes.example.test/static/main.css", "stylesheet", RouteVerdict.ABORT),
         ("https://quotes.example.test/logo.png", "image", RouteVerdict.ABORT),
