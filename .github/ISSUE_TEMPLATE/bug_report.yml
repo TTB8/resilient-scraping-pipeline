@@ -1,0 +1,22 @@
+name: Bug report
+description: Something behaves differently from the docs or the ADRs
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Run report or log excerpt
+      description: The relevant part of run_report.md or the JSON log (stderr). Remove anything private.
+      render: markdown
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `uv run pipeline version`.

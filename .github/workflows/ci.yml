@@ -77,3 +77,23 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           retention-days: 14
+
+  smoke:
+    name: Demo and Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync
+      - name: make demo (offline, against the local fixture server)
+        run: make demo
+      - name: docker build
+        run: docker build -t resilient-scraping-pipeline:ci .
+      - name: docker run
+        run: docker run --rm resilient-scraping-pipeline:ci version

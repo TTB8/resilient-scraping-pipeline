@@ -1,0 +1,16 @@
+name: Feature request
+description: A new capability or site
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and why the pipeline does not do it today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Note that anything that evades blocks (stealth, proxies, captcha solving) is out of scope (ADR 0005).
