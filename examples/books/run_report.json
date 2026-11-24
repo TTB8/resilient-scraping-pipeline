@@ -1,0 +1,39 @@
+{
+  "site": "books",
+  "fetch_run_id": "fetch-20261124T113839746297Z-0038acad",
+  "parse_run_id": "a77367703e6ff570",
+  "started_at": "2026-11-24T11:38:39.589537+00:00",
+  "finished_at": "2026-11-24T11:39:52.848239+00:00",
+  "duration_s": 73.258702,
+  "pages": {
+    "discovered": 72,
+    "fetched": 72,
+    "failed_by_class": {},
+    "http_requests": 73
+  },
+  "domains_stopped": [],
+  "parse": {
+    "item_pages_fetched": 20,
+    "item_pages_with_records": 20,
+    "records_parsed": 20,
+    "warnings": 0
+  },
+  "validation": {
+    "contract_version": "books/1.0.0",
+    "total_rows": 20,
+    "valid_rows": 20,
+    "quarantined_rows": 0,
+    "failure_rate": "0.0000",
+    "max_failure_rate": "0.0",
+    "rule_counts": {},
+    "verdict": "pass",
+    "verdict_reason": "0 of 20 rows quarantined, within max rate 0.0"
+  },
+  "deliverables": {
+    "published": [
+      "books.parquet",
+      "books.csv"
+    ],
+    "verdict_failed": false
+  }
+}

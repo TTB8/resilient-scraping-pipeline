@@ -1,0 +1,41 @@
+{
+  "site": "quotes",
+  "fetch_run_id": "fetch-20261124T114257396148Z-adeb3181",
+  "parse_run_id": "ecdb38dd4d2479d6",
+  "started_at": "2026-11-24T11:42:57.216478+00:00",
+  "finished_at": "2026-11-24T11:44:48.235099+00:00",
+  "duration_s": 111.018621,
+  "pages": {
+    "discovered": 60,
+    "fetched": 60,
+    "failed_by_class": {},
+    "http_requests": 111
+  },
+  "domains_stopped": [],
+  "parse": {
+    "item_pages_fetched": 60,
+    "item_pages_with_records": 60,
+    "records_parsed": 150,
+    "warnings": 0
+  },
+  "validation": {
+    "contract_version": "quotes/1.0.0",
+    "total_rows": 150,
+    "valid_rows": 150,
+    "quarantined_rows": 0,
+    "failure_rate": "0.0000",
+    "max_failure_rate": "0.0",
+    "rule_counts": {},
+    "verdict": "pass",
+    "verdict_reason": "0 of 150 rows quarantined, within max rate 0.0"
+  },
+  "deliverables": {
+    "published": [
+      "authors.parquet",
+      "authors.csv",
+      "quotes.parquet",
+      "quotes.csv"
+    ],
+    "verdict_failed": false
+  }
+}

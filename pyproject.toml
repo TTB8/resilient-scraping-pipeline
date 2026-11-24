@@ -44,7 +44,7 @@ ignore = ["PLR0913", "TRY003", "E501"]  # E501: the formatter owns code width; p
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts/demo.py"]
 plugins = ["pydantic.mypy"]
 
 # pyarrow ships no type stubs. Scoped here instead of `type: ignore` on every import.
