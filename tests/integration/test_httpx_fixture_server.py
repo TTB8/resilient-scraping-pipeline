@@ -1,6 +1,7 @@
 """HttpxFetcher against the local fixture server: real sockets, loopback only."""
 
 import socket
+import time
 
 from fetch_support import make_settings
 from fixture_server import FixtureServer, Phase
@@ -32,13 +33,26 @@ async def test_path_traversal_is_refused(fixture_server: FixtureServer) -> None:
     assert result.status == 404
 
 
-async def test_redirect_is_followed(fixture_server: FixtureServer) -> None:
+async def test_redirect_is_returned_for_the_scheduler(fixture_server: FixtureServer) -> None:
     fixture_server.redirect("/old", "/page/2/", status=301)
     async with HttpxFetcher(make_settings()) as fetcher:
         result = await fetcher.fetch(fixture_server.url("/old"))
-    assert result.status == 200
-    assert result.final_url == fixture_server.url("/page/2/")
-    assert fixture_server.hit_counts() == {"/old": 1, "/page/2/": 1}
+    assert result.status == 301
+    assert result.headers["location"] == "/page/2/"
+    assert result.final_url == fixture_server.url("/old")
+    assert fixture_server.hit_counts() == {"/old": 1}  # the hop is the scheduler's decision
+
+
+async def test_dripping_body_hits_the_overall_deadline(fixture_server: FixtureServer) -> None:
+    # 40 bytes, one every 0.1 s: every read is far inside httpx's per-read timeout, the whole
+    # body takes 4 s. Without the overall deadline this returned 200 after 4 s (R1-03).
+    fixture_server.scenario(Phase.drip(0.1))
+    async with HttpxFetcher(make_settings(request_timeout_s=0.5)) as fetcher:
+        started = time.monotonic()
+        result = await fetcher.fetch(fixture_server.url("/"))
+        took = time.monotonic() - started
+    assert result.error is TransportError.TIMEOUT
+    assert took < 1.5
 
 
 async def test_slow_response_maps_to_timeout(fixture_server: FixtureServer) -> None:
