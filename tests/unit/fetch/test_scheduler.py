@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from typing import Any
@@ -21,6 +21,7 @@ from scraping_pipeline.core.frontier import FrontierEntry
 from scraping_pipeline.core.types import FrontierStatus, ResponseClass
 from scraping_pipeline.fetch.fake import (
     FakeFetcher,
+    Respond,
     Step,
     block_page,
     challenge_page,
@@ -43,10 +44,14 @@ def u(path: str, host: str = HOST) -> str:
     return host + path
 
 
+def redirect(location: str, status: int = 302) -> Respond:
+    return Respond(status, b"", {"location": location})
+
+
 class Crawl:
     """One scheduler run in virtual time, with everything a test wants to inspect."""
 
-    def __init__(self, scripts: dict[str, Step | list[Step]] | None = None, **settings: Any):
+    def __init__(self, scripts: Mapping[str, Step | list[Step]] | None = None, **settings: Any):
         self.vt = VirtualTime()
         self.fake = FakeFetcher(scripts, sleep=self.vt.sleep, clock=self.vt.clock)
         self.sink = RecordingSink(clock=self.vt.clock)
@@ -392,45 +397,69 @@ async def test_robots_disallow_marks_skipped_without_a_request() -> None:
     assert summary.final_statuses == {FrontierStatus.SKIPPED_ROBOTS: 1, FrontierStatus.DONE: 1}
 
 
-async def test_robots_5xx_skips_the_whole_domain() -> None:
+async def test_robots_5xx_is_retried_then_stops_the_domain() -> None:
+    # R1-04: "we could not read the rules" is not "the rules forbid it". After max_attempts the
+    # domain is stopped (reset and retried by the next run), never finalised as skipped_robots.
     urls = [u("/a"), u("/b")]
-    crawl = Crawl({ROBOTS: server_error(503), **{x: ok() for x in urls}})
+    crawl = Crawl({ROBOTS: server_error(503), **{x: ok() for x in urls}}, max_attempts=3)
     summary = await crawl.run(urls)
-    assert crawl.fake.urls_called() == [ROBOTS]
-    assert {e.status for e in crawl.sink.finals().values()} == {FrontierStatus.SKIPPED_ROBOTS}
-    assert "disallow all" in summary.robots["quotes.example.test"]
-
-
-async def test_robots_unreachable_skips_the_whole_domain() -> None:
-    crawl = Crawl({ROBOTS: timeout(), u("/a"): ok()})
-    await crawl.run([u("/a")])
-    assert crawl.fake.urls_called() == [ROBOTS]
-    assert crawl.sink.finals()[u("/a")].status is FrontierStatus.SKIPPED_ROBOTS
-
-
-async def test_robots_crawl_delay_beyond_the_limit_stops_the_domain() -> None:
-    robots = ok("User-agent: *\nCrawl-delay: 3600\n", content_type="text/plain")
-    urls = [u("/a"), u("/b")]
-    crawl = Crawl({ROBOTS: robots, **{x: ok() for x in urls}}, max_crawl_delay_s=60)
-    summary = await crawl.run(urls)
-
-    assert crawl.page_calls() == []
+    assert crawl.fake.urls_called() == [ROBOTS] * 3
     assert {e.status for e in crawl.sink.finals().values()} == {FrontierStatus.STOPPED}
-    (stop,) = crawl.sink.of("stopped")
-    assert stop.reason is not None
-    assert "Crawl-delay 3600s exceeds the 60s limit" in stop.reason
-    # The stop is announced after the robots event that caused it.
-    kinds = [e.kind for e in crawl.sink.events]
-    assert kinds.index("robots") < kinds.index("stopped")
-    assert summary.domains_stopped == {"quotes.example.test": stop.reason}
+    reason = summary.domains_stopped["quotes.example.test"]
+    assert reason.startswith("robots.txt unreachable: 503 server error")
+    assert len(crawl.sink.of("stopped")) == 1
+    assert len(crawl.sink.of("robots")) == 1
 
 
-async def test_robots_crawl_delay_at_the_limit_is_honoured_not_stopped() -> None:
-    robots = ok("User-agent: *\nCrawl-delay: 60\n", content_type="text/plain")
-    crawl = Crawl({ROBOTS: robots, u("/a"): ok()}, max_crawl_delay_s=60)
-    summary = await crawl.run([u("/a")])
-    assert crawl.page_calls() == [u("/a")]
+async def test_robots_blip_recovers_on_retry() -> None:
+    urls = [u("/a"), u("/b")]
+    crawl = Crawl({ROBOTS: [server_error(503), ok("")], **{x: ok() for x in urls}})
+    summary = await crawl.run(urls)
+    assert crawl.fake.call_counts()[ROBOTS] == 2
+    assert summary.final_statuses == {FrontierStatus.DONE: 2}
     assert summary.domains_stopped == {}
+
+
+async def test_robots_retry_honours_retry_after() -> None:
+    crawl = Crawl({ROBOTS: [rate_limited("30"), ok("")], u("/a"): ok()})
+    await crawl.run([u("/a")])
+    assert crawl.starts(ROBOTS) == [0.0, pytest.approx(30.0)]
+    assert crawl.sink.finals()[u("/a")].status is FrontierStatus.DONE
+
+
+async def test_robots_unreachable_stops_the_whole_domain() -> None:
+    crawl = Crawl({ROBOTS: timeout(), u("/a"): ok()}, max_attempts=2)
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.urls_called() == [ROBOTS, ROBOTS]
+    assert crawl.sink.finals()[u("/a")].status is FrontierStatus.STOPPED
+    assert "robots.txt unreachable: timed out" in summary.domains_stopped["quotes.example.test"]
+
+
+async def test_robots_4xx_still_allows_everything() -> None:
+    crawl = Crawl({ROBOTS: Respond(410, b""), u("/a"): ok()})
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.call_counts()[ROBOTS] == 1
+    assert summary.final_statuses == {FrontierStatus.DONE: 1}
+
+
+async def test_robots_same_host_redirect_is_followed_with_a_token_per_hop() -> None:
+    moved = u("/rules/robots.txt")
+    rules = ok("User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: redirect(moved), moved: rules, u("/private/x"): ok(), u("/a"): ok()})
+    await crawl.run([u("/private/x"), u("/a")])
+    assert crawl.fake.urls_called()[:2] == [ROBOTS, moved]
+    assert crawl.starts(moved) == [1.0]  # the hop waited for its own token
+    finals = crawl.sink.finals()
+    assert finals[u("/private/x")].status is FrontierStatus.SKIPPED_ROBOTS
+    assert finals[u("/a")].status is FrontierStatus.DONE
+
+
+async def test_robots_off_host_redirect_stops_the_domain_without_following() -> None:
+    crawl = Crawl({ROBOTS: redirect("https://elsewhere.test/robots.txt"), u("/a"): ok()})
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.urls_called() == [ROBOTS]
+    reason = summary.domains_stopped["quotes.example.test"]
+    assert reason == "robots.txt unreachable: redirect to elsewhere.test refused"
 
 
 async def test_robots_crawl_delay_caps_the_rate() -> None:
@@ -493,7 +522,7 @@ async def test_sink_error_propagates_unwrapped() -> None:
             del entry, new_entry
             raise LookupError("sink is broken")
 
-    crawl = Crawl({ROBOTS: server_error()})
+    crawl = Crawl({ROBOTS: ok("User-agent: *\nDisallow: /\n", content_type="text/plain")})
     crawl.scheduler = PoliteScheduler(
         crawl.fake, crawl.settings, Boom(), clock=crawl.vt.clock, wall_clock=crawl.vt.wall,
         sleep=crawl.vt.sleep, rand=lambda: 0.5,
@@ -508,7 +537,9 @@ async def test_multiple_errors_stay_grouped() -> None:
             del new_entry
             raise LookupError(entry.url)
 
-    crawl = Crawl({ROBOTS: server_error(), u("/robots.txt", OTHER): server_error()})
+    # Both robots.txt files disallow everything, so both on_marked calls fail in the same instant.
+    closed = ok("User-agent: *\nDisallow: /\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: closed, u("/robots.txt", OTHER): closed})
     crawl.scheduler = PoliteScheduler(
         crawl.fake, crawl.settings, Boom(), clock=crawl.vt.clock, wall_clock=crawl.vt.wall,
         sleep=crawl.vt.sleep, rand=lambda: 0.5,
@@ -609,3 +640,143 @@ async def test_two_refusals_in_flight_stop_the_domain_once() -> None:
     assert len(crawl.sink.of("result")) == 2  # both in-flight answers are recorded
     assert u("/z") not in crawl.fake.urls_called()
     assert summary.final_statuses == {FrontierStatus.STOPPED: 3}
+
+
+# --- redirects are followed by the scheduler, inside the site (R1-01) ----------------------------
+
+
+async def test_same_origin_redirect_is_followed_as_a_new_request() -> None:
+    crawl = Crawl({u("/old"): redirect("/new", 301), u("/new"): ok("<html>moved</html>")})
+    summary = await crawl.run([u("/old")])
+
+    assert crawl.fake.urls_called() == [ROBOTS, u("/old"), u("/new")]
+    assert crawl.starts(u("/new")) == [2.0]  # the hop took its own token (1 req/s)
+    done = crawl.sink.of("result")[0]
+    assert done.result is not None
+    assert done.result.requested_url == u("/old")
+    assert done.result.final_url == u("/new")
+    assert done.result.body == b"<html>moved</html>"
+    assert crawl.sink.finals()[u("/old")].status is FrontierStatus.DONE
+    assert (summary.attempts, summary.requests) == (1, 3)
+
+
+@pytest.mark.parametrize(
+    ("location", "host"),
+    [
+        ("http://169.254.169.254/latest/meta-data/", "169.254.169.254"),
+        ("http://127.0.0.1:8080/admin", "127.0.0.1"),
+        ("https://books.example.test/x", "books.example.test"),
+        ("http://quotes.example.test/a", "quotes.example.test"),  # other scheme
+        ("https://quotes.example.test:8443/a", "quotes.example.test"),  # other port
+    ],
+)
+async def test_off_site_redirect_is_refused_permanently(location: str, host: str) -> None:
+    crawl = Crawl({u("/go"): redirect(location)})
+    await crawl.run([u("/go")])
+
+    assert crawl.fake.urls_called() == [ROBOTS, u("/go")]  # never followed, never retried
+    final = crawl.sink.finals()[u("/go")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT
+    assert final.last_class is ResponseClass.CLIENT_ERROR
+    assert f"off-site redirect to {host} refused" in (final.last_reason or "")
+
+
+async def test_fetcher_that_followed_off_site_is_refused() -> None:
+    # Defence in depth: a fetcher reporting a final_url on another origin (Patrick's repro).
+    page = Respond(200, b"<html>x</html>", final_url="http://169.254.169.254/latest/meta-data/")
+    crawl = Crawl({u("/a"): page})
+    await crawl.run([u("/a")])
+    final = crawl.sink.finals()[u("/a")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT
+    assert "off-site redirect to 169.254.169.254 refused" in (final.last_reason or "")
+
+
+async def test_redirect_loop_is_permanent_after_five_hops() -> None:
+    chain = {u(f"/l{n}"): redirect(f"/l{n + 1}") for n in range(10)}
+    crawl = Crawl(chain)
+    await crawl.run([u("/l0")])
+
+    pages = [x for x in crawl.fake.urls_called() if x != ROBOTS]
+    assert pages == [u(f"/l{n}") for n in range(6)]  # the request plus five hops, then stop
+    final = crawl.sink.finals()[u("/l0")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT  # not 5 attempts x 6 requests
+    assert "redirect loop" in (final.last_reason or "")
+
+
+async def test_redirect_into_a_robots_disallowed_path_is_refused() -> None:
+    robots = ok("User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: robots, u("/a"): redirect("/private/x"), u("/private/x"): ok()})
+    await crawl.run([u("/a")])
+    assert u("/private/x") not in crawl.fake.urls_called()
+    assert "robots.txt disallows" in (crawl.sink.finals()[u("/a")].last_reason or "")
+
+
+async def test_redirect_to_a_non_http_scheme_is_refused() -> None:
+    crawl = Crawl({u("/a"): redirect("ftp://quotes.example.test/file")})
+    await crawl.run([u("/a")])
+    final = crawl.sink.finals()[u("/a")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT
+    assert "not an http(s) URL" in (final.last_reason or "")
+
+
+async def test_rate_bound_counts_every_redirect_hop() -> None:
+    urls = [u(f"/r{n}") for n in range(6)]
+    scripts: dict[str, Step | list[Step]] = {}
+    for n in range(6):
+        scripts[u(f"/r{n}")] = redirect(f"/r{n}/h1")
+        scripts[u(f"/r{n}/h1")] = redirect(f"/r{n}/h2")
+        scripts[u(f"/r{n}/h2")] = ok()
+    crawl = Crawl(scripts, requests_per_second=2.0, burst=2, max_concurrency_per_domain=4)
+    summary = await crawl.run(urls)
+    times = [c.started_at for c in crawl.fake.calls]
+    assert len(times) == summary.requests == 1 + 6 * 3
+    assert_rate_respected(times, 2.0, 2)
+    assert summary.final_statuses == {FrontierStatus.DONE: 6}
+
+
+# --- breaker: a stale result is not the probe's answer (R1-10) -----------------------------------
+
+
+async def test_stale_ok_does_not_close_the_half_open_breaker() -> None:
+    late = FrontierEntry(
+        url=u("/c"), site=entry(u("/c")).site, kind=entry(u("/c")).kind, depth=0,
+        next_attempt_at=EPOCH + 10,
+    )  # fmt: skip
+    crawl = Crawl(
+        {
+            u("/slow"): slow(ok(), 20.0),  # sent at t=0, before the breaker opens; back at t=20
+            u("/fail"): [timeout(), slow(ok(), 30.0)],  # opens it; then the probe, out 5..35
+            u("/c"): ok(),
+        },
+        requests_per_second=5.0,
+        burst=5,
+        max_concurrency_per_domain=3,
+        breaker_failure_threshold=1,
+        breaker_cooldown_s=5.0,
+    )
+    await crawl.vt.run(crawl.scheduler.run([entry(u("/slow")), entry(u("/fail")), late]))
+
+    probe = [c for c in crawl.fake.calls if c.url == u("/fail")][1]
+    assert probe.started_at == pytest.approx(5.0)
+    assert probe.ended_at == pytest.approx(35.0)
+    # /c is due at t=10 while the probe is out. The stale ok from /slow at t=20 must not let it go.
+    assert crawl.starts(u("/c")) == [pytest.approx(35.0)]
+    assert {e.status for e in crawl.sink.finals().values()} == {FrontierStatus.DONE}
+
+
+# --- bucket: a 429 on a slow request still costs the next request a full interval (R1-11) --------
+
+
+async def test_next_request_after_a_slow_429_waits_a_full_interval() -> None:
+    crawl = Crawl(
+        {u("/a"): [slow(rate_limited(None), 3.0), ok()], u("/b"): ok()},
+        requests_per_second=1.0,
+        max_concurrency_per_domain=1,
+    )
+    await crawl.run([u("/a"), u("/b")])
+    first = crawl.fake.calls[1]
+    assert first.url == u("/a")
+    assert first.ended_at == pytest.approx(4.0)  # sent at t=1, the 429 seen at t=4
+    after = [c.started_at for c in crawl.fake.calls[2:]]
+    # Rate halved to 0.5/s: the next request goes 2 s after the 429, not at once.
+    assert min(after) == pytest.approx(4.0 + 2.0)

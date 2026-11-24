@@ -42,7 +42,9 @@ CHALLENGE_PAGE = (
 
 @dataclass(frozen=True, slots=True)
 class Respond:
-    """An HTTP answer. ``final_url`` simulates a followed redirect."""
+    """An HTTP answer. ``final_url`` simulates a fetcher that followed a redirect by itself, which
+    real fetchers never do; the scheduler refuses one that ends on another origin. Script a real
+    redirect as a 3xx with a ``location`` header instead."""
 
     status: int
     body: bytes = b""
