@@ -4,3 +4,4 @@
 scripts/harness/** text eol=lf
 .githooks/* text eol=lf
 # harness-kit:end
+tests/fixtures/sites/** linguist-vendored -diff
