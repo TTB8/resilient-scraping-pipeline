@@ -32,15 +32,24 @@ redirects is aborted. ``final_url`` is the URL of the document the browser actua
 (``response.url``), never assumed, so the scheduler's ``final_url`` check still guards the result
 if a browser ever got past the handler.
 
+Size: the document fetched by ``route.fetch`` is capped at ``max_body_bytes``, the same cap the
+httpx fetcher applies and with the same result (a ``protocol`` error, ``body larger than N bytes``,
+no body kept): a declared ``Content-Length`` over the cap is refused without reading the body, and
+otherwise the decoded body's length is checked before it is handed to Chromium. Playwright has no
+streaming route body, so the driver has already downloaded the whole response by then; a chunked
+answer with no length is only refused after it is in the driver's memory. The rendered DOM is
+capped again after rendering.
+
 Budget: the document is the request that took a token. The same-origin scripts it pulls in are not
 throttled separately; they are bounded by the page itself (a handful per page), which is the
 documented exception to "one token per request". They are *not* cached: Playwright disables the
 HTTP cache while routing is enabled, so every page downloads its scripts again.
 
 Lifecycle: the browser is launched once, lazily on the first ``fetch`` (or on ``__aenter__``), with
-one browser context for the run; each fetch opens and closes its own page. Failing to *launch* the
-browser raises: it means the environment is broken (Chromium not installed), which is not a fact
-about the site and must not be recorded as one.
+one browser context for the run; each fetch opens and closes its own page. Failing to start the
+driver, launch the browser or open its context raises :class:`BrowserUnavailableError`: it means
+the environment is broken (Chromium not installed, or a system library it or the driver needs is
+missing), which is not a fact about the site and must not be recorded as one.
 
 Waiting for content: navigation and the selector wait share one deadline of ``request_timeout_s``,
 measured from the start of the fetch. After navigation, when ``wait_for_selector`` is set and the
@@ -59,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -68,6 +78,7 @@ from typing import Self
 from urllib.parse import urlsplit
 
 from playwright.async_api import (
+    APIResponse,
     Browser,
     BrowserContext,
     Page,
@@ -113,14 +124,27 @@ _NET_ERRORS: tuple[tuple[str, TransportError], ...] = (
 )
 
 _REFUSALS = frozenset({ResponseClass.BLOCKED, ResponseClass.CHALLENGE})
+_URL = re.compile(r"\S+://\S*")
+
+
+class BrowserUnavailableError(RuntimeError):
+    """The browser cannot be used here: the driver did not start, or Chromium did not launch.
+
+    An environment fact (not installed, a missing system library), never a fact about a site. The
+    CLI maps it to exit 2 with the fix.
+    """
 
 
 def map_playwright_error(message: str) -> TransportError:
     """The :class:`TransportError` for a Playwright navigation error message.
 
+    Only the error itself is read: its first line, with any URL removed. Playwright appends a
+    ``Call log:`` with the request line and headers, and an error names the URL it failed at, so a
+    URL such as ``/tag/timeout/`` must not make an unknown error look like a timeout.
     Unknown messages map to ``protocol``: the browser got *something* it could not use.
     """
-    lowered = message.lower()
+    lines = message.strip().splitlines()
+    lowered = _URL.sub(" ", lines[0] if lines else "").lower()
     for needle, error in _NET_ERRORS:
         if needle in lowered:
             return error
@@ -200,8 +224,10 @@ class _PageGuard:
     target: str
     deadline: float  # in ``clock`` seconds
     clock: Callable[[], float]
+    max_body: int = DEFAULT_MAX_BODY_BYTES
     document_seen: bool = False
     redirect: tuple[int, dict[str, str]] | None = None  # the document's 3xx, not followed
+    oversize: tuple[int, dict[str, str]] | None = None  # the document's answer, over the cap
     document_error: str | None = None  # why the document request itself failed
     blocked: list[str] = field(default_factory=list)
 
@@ -240,10 +266,25 @@ class _PageGuard:
                 self.blocked.append(request.url)
                 await route.abort("blockedbyclient")
                 return
+            if await self._too_big(response):
+                if main:  # reported like the httpx fetcher's oversized body
+                    self.oversize = (response.status, dict(response.headers))
+                self.blocked.append(request.url)
+                await route.abort("failed")
+                return
             headers = {k: v for k, v in response.headers.items() if k.lower() not in _WIRE_HEADERS}
             await route.fulfill(response=response, headers=headers)
         finally:
             await response.dispose()  # the driver keeps every fetched body until disposed
+
+    async def _too_big(self, response: APIResponse) -> bool:
+        """The httpx fetcher's rule: a declared length over the cap, or a decoded body over it."""
+        declared = next(
+            (v.strip() for k, v in response.headers.items() if k.lower() == "content-length"), ""
+        )
+        if declared.isdigit() and int(declared) > self.max_body:
+            return True
+        return len(await response.body()) > self.max_body
 
 
 _SELECTOR_MARGIN_S = 0.25  # left of the deadline after the selector wait, to read the page
@@ -304,9 +345,19 @@ class PlaywrightFetcher:
             if self._closed:
                 raise RuntimeError("PlaywrightFetcher used after aclose()")
             if self._context is None:
-                self._playwright = await async_playwright().start()
-                self._browser = await self._playwright.chromium.launch(**launch_options())  # type: ignore[arg-type]
-                self._context = await self._browser.new_context(user_agent=self._user_agent)
+                try:
+                    self._playwright = await async_playwright().start()
+                    self._browser = await self._playwright.chromium.launch(**launch_options())  # type: ignore[arg-type]
+                    self._context = await self._browser.new_context(user_agent=self._user_agent)
+                except Exception as exc:
+                    # The driver failing to start raises a bare Exception ("Connection closed while
+                    # reading from the driver"), a missing Chromium a PlaywrightError: both are the
+                    # environment. Close what did start, then report it as one typed error.
+                    with contextlib.suppress(Exception):
+                        await self.aclose()
+                    self._closed = False  # not closed by the caller: a later call may try again
+                    text = str(exc).strip() or type(exc).__name__
+                    raise BrowserUnavailableError(f"{type(exc).__name__}: {text}") from exc
             return self._context
 
     async def fetch(self, url: str) -> FetchResult:
@@ -315,7 +366,9 @@ class PlaywrightFetcher:
         started = self._clock()
         deadline = started + self._deadline_s
         page = await context.new_page()
-        guard = _PageGuard(target=url, deadline=deadline, clock=self._clock)
+        guard = _PageGuard(
+            target=url, deadline=deadline, clock=self._clock, max_body=self._max_body
+        )
         await page.route("**/*", guard.handle)
         try:
             try:
@@ -341,15 +394,23 @@ class PlaywrightFetcher:
     def _left_ms(self, deadline: float) -> float:
         return max(_MIN_TIMEOUT_MS, (deadline - self._clock()) * 1000)
 
+    def _not_navigated(self, guard: _PageGuard, exc: PlaywrightError) -> _Outcome:
+        """Why ``goto`` raised: the handler aborted the document on purpose, or it failed."""
+        if guard.redirect is not None:  # the site redirected: report it, do not follow
+            status, headers = guard.redirect
+            return _Outcome(status, headers, b"", None, None)
+        if guard.oversize is not None:  # what the httpx fetcher reports for the same answer
+            status, headers = guard.oversize
+            detail = f"body larger than {self._max_body} bytes"
+            return _Outcome(status, headers, b"", TransportError.PROTOCOL, detail)
+        message = guard.document_error if guard.document_error is not None else exc.message
+        return _Outcome.failed(map_playwright_error(message), _first_line(message))
+
     async def _navigate(self, page: Page, url: str, guard: _PageGuard, deadline: float) -> _Outcome:
         try:
             response = await page.goto(url, timeout=self._left_ms(deadline), wait_until="load")
         except PlaywrightError as exc:
-            if guard.redirect is not None:  # the site redirected: report it, do not follow
-                status, headers = guard.redirect
-                return _Outcome(status, headers, b"", None, None)
-            message = guard.document_error if guard.document_error is not None else exc.message
-            return _Outcome.failed(map_playwright_error(message), _first_line(message))
+            return self._not_navigated(guard, exc)
         if response is None:
             return _Outcome.failed(TransportError.PROTOCOL, "navigation produced no response")
         final_url = response.url  # the document the browser rendered, whatever was asked for

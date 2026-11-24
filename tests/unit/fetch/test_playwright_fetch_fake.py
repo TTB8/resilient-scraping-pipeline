@@ -31,8 +31,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from fetch_support import make_settings
 from scraping_pipeline.core.classify import TransportError, classify
 from scraping_pipeline.core.types import ResponseClass
+from scraping_pipeline.fetch import playwright_fetcher
 from scraping_pipeline.fetch.fake import CHALLENGE_PAGE
-from scraping_pipeline.fetch.playwright_fetcher import PlaywrightFetcher
+from scraping_pipeline.fetch.playwright_fetcher import BrowserUnavailableError, PlaywrightFetcher
+from scraping_pipeline.fetch.protocol import DEFAULT_MAX_BODY_BYTES
 
 TARGET = "https://quotes.example.test/js/"
 QUOTES = b"<html><head><title>Quotes</title></head><body><div class=quote>q</div></body></html>"
@@ -66,11 +68,19 @@ class FakeNet:
 
 @dataclass
 class FakeAPIResponse:
+    """The driver's fetched response: ``payload`` is already decoded and whole, as in the driver
+    (it decodes gzip, deflate and br; ``headers`` still describe the bytes on the wire)."""
+
     url: str
     status: int
     headers: dict[str, str]
-    body: bytes
+    payload: bytes
     disposed: bool = False
+    body_reads: int = 0
+
+    async def body(self) -> bytes:
+        self.body_reads += 1
+        return self.payload
 
     async def dispose(self) -> None:
         self.disposed = True
@@ -179,7 +189,7 @@ class FakePage:
             code = "failed" if route.action is None else route.action.removeprefix("abort:")
             raise PlaywrightError(f"page.goto: net::ERR_{code.upper()} at {url}")
         assert route.response is not None
-        self.html = route.response.body.decode("utf-8")
+        self.html = route.response.payload.decode("utf-8")
         for script in self.scripts:
             await self._send(script, "script", navigation=False)
         headers = route.fulfil_headers if route.fulfil_headers is not None else {}
@@ -214,13 +224,14 @@ def fetcher_for(
     *,
     timeout_s: float = 2.0,
     selector: str | None = ".quote",
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     monkeypatch: pytest.MonkeyPatch,
 ) -> PlaywrightFetcher:
     settings = make_settings(request_timeout_s=timeout_s)
     fetcher = (
-        PlaywrightFetcher(settings, selector, clock=page.clock)
+        PlaywrightFetcher(settings, selector, clock=page.clock, max_body_bytes=max_body_bytes)
         if page.clock is not None
-        else PlaywrightFetcher(settings, selector)
+        else PlaywrightFetcher(settings, selector, max_body_bytes=max_body_bytes)
     )
     context = FakeContext(page)
 
@@ -381,3 +392,153 @@ async def test_document_request_failure_is_mapped(monkeypatch: pytest.MonkeyPatc
     assert result.error_detail is not None
     assert "ECONNREFUSED" in result.error_detail
     assert page.routes[0].action == "abort:failed"
+
+
+# --- R3-05: the document is capped on the wire, like the httpx path ----------------------------
+
+BIG = b"<html><body>" + b"x" * 200 + b"</body></html>"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {**HTML, "content-length": str(len(BIG))},  # declared: refused before reading the body
+        HTML,  # chunked, no length: the decoded body is measured
+        {**HTML, "content-encoding": "gzip", "content-length": "40"},  # small on the wire only
+    ],
+)
+async def test_an_oversized_document_is_refused_like_the_httpx_path(
+    headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = FakePage(FakeNet({TARGET: (200, headers, BIG)}), clock=FakeClock())
+    fetcher = fetcher_for(page, max_body_bytes=100, monkeypatch=monkeypatch)
+    result = await fetcher.fetch(TARGET)
+    # The httpx fetcher's answer to the same response: status kept, no body, a protocol error.
+    assert result.status == 200
+    assert result.error is TransportError.PROTOCOL
+    assert result.error_detail == "body larger than 100 bytes"
+    assert result.body == b""
+    document = page.routes[0]
+    assert document.action == "abort:failed"  # never handed to Chromium
+    assert document.response is None
+    assert page.selector_timeouts == []
+
+
+async def test_a_declared_oversized_length_is_refused_without_reading_the_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses: list[FakeAPIResponse] = []
+    net = FakeNet({TARGET: (200, {**HTML, "Content-Length": str(len(BIG))}, BIG)})
+    original = net.get
+
+    def spy(url: str, max_redirects: int) -> FakeAPIResponse:
+        responses.append(original(url, max_redirects))
+        return responses[-1]
+
+    monkeypatch.setattr(net, "get", spy)
+    page = FakePage(net, clock=FakeClock())
+    result = await fetcher_for(page, max_body_bytes=100, monkeypatch=monkeypatch).fetch(TARGET)
+    assert result.error is TransportError.PROTOCOL
+    assert [r.body_reads for r in responses] == [0]
+    assert responses[0].disposed
+
+
+async def test_a_document_at_the_cap_is_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = FakePage(FakeNet({TARGET: (200, HTML, BIG)}), clock=FakeClock(), selector_present=True)
+    fetcher = fetcher_for(page, max_body_bytes=len(BIG), monkeypatch=monkeypatch)
+    result = await fetcher.fetch(TARGET)
+    assert (result.status, result.error, result.body) == (200, None, BIG)
+
+
+async def test_an_oversized_script_is_aborted_and_the_document_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = "https://quotes.example.test/static/huge.js"
+    net = FakeNet({TARGET: (200, HTML, QUOTES), script: (200, {}, b"x" * 500)})
+    page = FakePage(net, clock=FakeClock(), selector_present=True, scripts=(script,))
+    result = await fetcher_for(page, max_body_bytes=200, monkeypatch=monkeypatch).fetch(TARGET)
+    assert (result.status, result.error) == (200, None)
+    assert [r.action for r in page.routes] == ["fulfill", "abort:failed"]
+
+
+# --- R3-10: a compressed answer is handed to Chromium decoded, without its wire headers ----------
+
+
+async def test_a_compressed_document_is_fulfilled_without_its_wire_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire = {
+        **HTML,
+        "content-encoding": "gzip",
+        "content-length": "61",  # the compressed size, not the decoded body's
+        "transfer-encoding": "chunked",
+        "connection": "close",
+        "x-kept": "yes",
+    }
+    page = FakePage(
+        FakeNet({TARGET: (200, wire, QUOTES)}), clock=FakeClock(), selector_present=True
+    )
+    result = await fetcher_for(page, monkeypatch=monkeypatch).fetch(TARGET)
+    document = page.routes[0]
+    assert document.action == "fulfill"
+    assert document.fulfil_headers == {**HTML, "x-kept": "yes"}
+    assert result.body == QUOTES  # the decoded bytes, rendered once
+    assert result.error is None
+
+
+# --- R3-01: a browser that cannot start is one typed error -------------------------------------
+
+
+class _FakePlaywright:
+    def __init__(self, launch_error: BaseException | None) -> None:
+        self.launch_error = launch_error
+        self.stopped = False
+        self.chromium = self
+
+    async def launch(self, **_: Any) -> Any:
+        assert self.launch_error is not None
+        raise self.launch_error
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakeStarter:
+    def __init__(self, start_error: BaseException | None, playwright: _FakePlaywright) -> None:
+        self.start_error = start_error
+        self.playwright = playwright
+
+    async def start(self) -> _FakePlaywright:
+        if self.start_error is not None:
+            raise self.start_error
+        return self.playwright
+
+
+@pytest.mark.parametrize(
+    ("start_error", "launch_error", "needle"),
+    [
+        # The bundled node cannot load a system library: the driver never starts.
+        (Exception("Connection closed while reading from the driver"), None, "Connection closed"),
+        (None, PlaywrightError("BrowserType.launch: Executable doesn't exist at /x"), "Executable"),
+        (
+            None,
+            PlaywrightError("BrowserType.launch: error while loading shared libraries: libnss3.so"),
+            "libnss3",
+        ),
+    ],
+)
+async def test_a_browser_that_cannot_start_raises_browser_unavailable(
+    start_error: BaseException | None,
+    launch_error: BaseException | None,
+    needle: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    playwright = _FakePlaywright(launch_error)
+    monkeypatch.setattr(
+        playwright_fetcher, "async_playwright", lambda: _FakeStarter(start_error, playwright)
+    )
+    fetcher = PlaywrightFetcher(make_settings(), ".quote")
+    with pytest.raises(BrowserUnavailableError, match=needle):
+        async with fetcher:
+            pass
+    assert playwright.stopped is (start_error is None)  # what did start is closed again

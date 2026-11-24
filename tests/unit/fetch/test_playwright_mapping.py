@@ -39,6 +39,30 @@ def test_navigation_errors_map(message: str, expected: TransportError) -> None:
     assert map_playwright_error(message) is expected
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # R3-04: Playwright appends a call log with the request line; the URL is not the error.
+        "route.fetch: unexpected server response\nCall log:\n"
+        "  - \u2192 GET https://quotes.example.test/tag/timeout/\n"
+        "  - user-agent: pipeline\n",
+        # An error names the URL it failed at; a URL is never read as the error either.
+        "page.goto: net::ERR_ABORTED at https://quotes.example.test/tag/timeout/",
+        "page.goto: net::ERR_FAILED at https://quotes.example.test/econnrefused/certificate/",
+    ],
+)
+def test_a_url_in_the_message_or_call_log_is_not_the_error(message: str) -> None:
+    assert map_playwright_error(message) is TransportError.PROTOCOL
+
+
+def test_the_error_on_the_first_line_still_maps_with_a_call_log() -> None:
+    message = (
+        "route.fetch: connect ECONNREFUSED 127.0.0.1:9\nCall log:\n"
+        "  - \u2192 GET https://quotes.example.test/tag/timeout/\n"
+    )
+    assert map_playwright_error(message) is TransportError.CONNECT
+
+
 def test_refusal_pages_are_recognised_by_core_classify() -> None:
     assert is_refusal_page(200, {}, CHALLENGE_PAGE)
     assert is_refusal_page(403, {}, BLOCK_PAGE)
