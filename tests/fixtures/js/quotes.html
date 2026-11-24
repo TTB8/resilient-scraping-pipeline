@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Rendered quotes (test fixture)</title>
+</head>
+<body>
+  <!-- Original markup for the browser test. The quotes exist only after the script runs, so a
+       fetcher that does not execute JavaScript sees an empty #quotes container. -->
+  <main id="quotes"></main>
+  <nav><ul class="pager" id="pager"></ul></nav>
+  <script>
+    var data = [
+      { text: "“A test that never fails proves very little.”",
+        author: "Fixture Author", tags: ["testing", "humility"] },
+      { text: "“Slow is smooth, and smooth is fast.”",
+        author: "Second Author", tags: ["pace"] },
+      { text: "“The second request can wait a second.”",
+        author: "Polite Crawler", tags: ["politeness", "rate-limits"] }
+    ];
+    function render() {
+      var root = document.getElementById("quotes");
+      data.forEach(function (q) {
+        var quote = document.createElement("div");
+        quote.className = "quote";
+        var text = document.createElement("span");
+        text.className = "text";
+        text.textContent = q.text;
+        var by = document.createElement("span");
+        by.appendChild(document.createTextNode("by "));
+        var author = document.createElement("small");
+        author.className = "author";
+        author.textContent = q.author;
+        by.appendChild(author);
+        var tags = document.createElement("div");
+        tags.className = "tags";
+        q.tags.forEach(function (t) {
+          var a = document.createElement("a");
+          a.className = "tag";
+          a.href = "/tag/" + t + "/";
+          a.textContent = t;
+          tags.appendChild(a);
+        });
+        quote.appendChild(text);
+        quote.appendChild(by);
+        quote.appendChild(tags);
+        root.appendChild(quote);
+      });
+      var next = document.createElement("li");
+      next.className = "next";
+      var link = document.createElement("a");
+      link.href = "/_js/quotes-2.html";
+      link.textContent = "Next";
+      next.appendChild(link);
+      document.getElementById("pager").appendChild(next);
+    }
+    // Render after load, with a delay, so the fetcher must really wait for the selector.
+    window.addEventListener("load", function () { setTimeout(render, 150); });
+  </script>
+</body>
+</html>
