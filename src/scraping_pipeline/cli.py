@@ -14,8 +14,9 @@ them without reading logs:
       a crash is 4, never 1
 2     usage or environment error: a bad option or setting, a stage's input missing (run the
       previous stage first), another pipeline process holding the state database, a data
-      directory that cannot be written or opened (the message names the path), or Chromium not
-      installed for the JavaScript site (run ``make browsers``)
+      directory that cannot be written or opened (the message names the path), or a browser for
+      the JavaScript site that is not installed or cannot start (``make browsers``; a missing
+      system library: ``uv run playwright install-deps chromium``)
 3     a domain was stopped (blocked, a challenge, rate limited beyond our limits). The other
       stages still ran on what was fetched; the report says why. Distinct from 1 because the cure
       differs: wait, look at the site, then ``fetch --retry-failed``; not fix a parser
@@ -34,6 +35,8 @@ mapped ones above into exit 4, so "the program crashed" can never be read as "th
 from __future__ import annotations
 
 import functools
+import os
+import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -43,13 +46,13 @@ from typing import Annotated, Any
 
 import duckdb
 import typer
-from playwright.async_api import Error as PlaywrightError
 from pydantic import ValidationError
 
 from scraping_pipeline import __version__
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.types import FrontierStatus, Site
 from scraping_pipeline.core.urls import domain as domain_of
+from scraping_pipeline.fetch.playwright_fetcher import BrowserUnavailableError
 from scraping_pipeline.logging import configure_logging, get_logger
 from scraping_pipeline.stages import (
     run_discover,
@@ -127,30 +130,85 @@ def _settings(
     return settings
 
 
-def _data_dir_message(path: Path, detail: object) -> str:
-    return (
+_DOCKER_HINT = 'In Docker, run as your own user: docker run --user "$(id -u):$(id -g)" ...'
+
+
+def _data_dir_message(path: Path, detail: object, *, permission: bool) -> str:
+    """Exit-2 text for a data path that cannot be used.
+
+    The Docker hint is given for a permission error only: for a path that is a file, a full disk
+    or a read-only filesystem it would send the user the wrong way.
+    """
+    message = (
         f"the data directory {path} cannot be written or opened ({detail}). Check that it exists "
-        "and that this user may write to it (PIPELINE_DATA_DIR or --data-dir to use another). "
-        'In Docker, run as your own user: docker run --user "$(id -u):$(id -g)" ...'
+        "and that this user may write to it (PIPELINE_DATA_DIR or --data-dir to use another)."
     )
+    return f"{message} {_DOCKER_HINT}" if permission else message
+
+
+def _state_db_message(path: Path, exc: duckdb.IOException) -> str:
+    """Exit-2 text for a state database duckdb cannot open: unreadable, or not a database."""
+    text = str(exc)
+    if "not a valid duckdb database" in text.lower():
+        return (
+            f"the state database {path} cannot be opened: it is not a valid DuckDB file ({text}). "
+            "Move it aside and re-run: discover rebuilds the frontier from the page cache. Or "
+            "use another data directory (PIPELINE_DATA_DIR or --data-dir)."
+        )
+    return _data_dir_message(path, text, permission="permission denied" in text.lower())
 
 
 def _require_writable(path: Path) -> None:
-    """Fail with exit 2 and the path, before any stage starts, if ``path`` cannot be written."""
+    """Fail with exit 2 and the path, before any stage starts, if ``path`` cannot be written.
+
+    Not redundant with the mapping in :func:`_guarded`, although for an unwritable data directory
+    both give the same message (review mutant C3): this check runs *before* any stage, so a run
+    that cannot write never sends a request, opens the state database or records a run, while
+    :func:`_guarded` only catches the failure where it happens (a fetch stage would have crawled
+    by then). ``_guarded`` remains for what a pre-check cannot see: a disk that fills up, a file
+    whose permissions change mid-run, a corrupt state database.
+    """
     try:
         path.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=path):
             pass
     except OSError as exc:
-        raise _fail(_data_dir_message(path, exc.strerror or exc), ExitCode.USAGE) from None
+        message = _data_dir_message(
+            path, exc.strerror or exc, permission=isinstance(exc, PermissionError)
+        )
+        raise _fail(message, ExitCode.USAGE) from None
 
 
-def _browser_missing(exc: BaseException) -> bool:
-    """Playwright's launch failure for a browser that is not installed (or cannot start)."""
-    text = str(exc)
-    return isinstance(exc, PlaywrightError) and (
-        "Executable doesn't exist" in text or "playwright install" in text
-    )
+def _first_line(exc: BaseException) -> str:
+    lines = str(exc).strip().splitlines()
+    return lines[0] if lines else type(exc).__name__
+
+
+def _stdout_gone() -> None:
+    """The reader of stdout went away (``pipeline run | head``): not an error, and not a bug.
+
+    Python's documented recipe (the ``signal`` module's note on SIGPIPE): point stdout at
+    ``os.devnull``, so the interpreter's final flush cannot fail again (which exits 120). The
+    command then exits with the code its data earned. Click would exit 1 here, which this CLI
+    reserves for a failed validation.
+    """
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):  # not a real file (a test runner's buffer)
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, fd)
+    finally:
+        os.close(devnull)
+
+
+def _out(text: str, *, nl: bool = True) -> None:
+    """Print command output on stdout; a closed stdout is not an error (:func:`_stdout_gone`)."""
+    try:
+        typer.echo(text, nl=nl)
+    except BrokenPipeError:
+        _stdout_gone()
 
 
 def _is_under(filename: object, root: Path) -> bool:
@@ -176,24 +234,26 @@ def _guarded(settings: Settings) -> Iterator[None]:
         ) from None
     except (StageInputError, StateLockedError) as exc:
         raise _fail(str(exc), ExitCode.USAGE) from None
-    except PlaywrightError as exc:
-        if not _browser_missing(exc):
-            raise
-        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    except BrowserUnavailableError as exc:
         raise _fail(
-            "the browser for the JavaScript-rendered site is not installed or cannot start: "
-            "run `make browsers` (uv run playwright install chromium; in Docker, build with "
-            f"--build-arg WITH_BROWSER=1). Playwright said: {first_line}",
+            "the browser for the JavaScript-rendered site is not installed or cannot start. "
+            "Install it with `make browsers` (uv run playwright install chromium). If it is "
+            "installed, install the browser's system dependencies: `uv run playwright "
+            "install-deps chromium` (as root). In Docker, build with --build-arg WITH_BROWSER=1. "
+            f"Playwright said: {_first_line(exc)}",
             ExitCode.USAGE,
         ) from None
     except duckdb.IOException as exc:
-        raise _fail(_data_dir_message(settings.state_db, exc), ExitCode.USAGE) from None
+        raise _fail(_state_db_message(settings.state_db, exc), ExitCode.USAGE) from None
     except OSError as exc:
         if not _is_under(exc.filename, settings.data_dir):
             raise
-        raise _fail(
-            _data_dir_message(Path(str(exc.filename)), exc.strerror or exc), ExitCode.USAGE
-        ) from None
+        message = _data_dir_message(
+            Path(str(exc.filename)),
+            exc.strerror or exc,
+            permission=isinstance(exc, PermissionError),
+        )
+        raise _fail(message, ExitCode.USAGE) from None
 
 
 def _command[**P, R](body: Callable[P, R]) -> Callable[P, R]:
@@ -240,7 +300,7 @@ def main() -> None:
 @_command
 def version() -> None:
     """Print the package version."""
-    typer.echo(__version__)
+    _out(__version__)
 
 
 @app.command()
@@ -254,7 +314,7 @@ def discover(
     """Add seed URLs and plan links from pages already cached (offline)."""
     settings = _settings(data_dir, max_pages, max_depth)
     result = _call(settings, lambda: run_discover(settings, site))
-    typer.echo(
+    _out(
         f"discover: {result.seeds_added} seeds and {result.links_added} links added, "
         f"frontier {result.frontier_size}"
     )
@@ -278,7 +338,7 @@ def fetch(
     """Fetch every pending URL politely into the cache (the only stage that uses the network)."""
     settings = _settings(data_dir, max_pages, max_depth)
     result = _call(settings, lambda: run_fetch(settings, site, retry_failed=retry_failed))
-    typer.echo(_fetch_line(result))
+    _out(_fetch_line(result))
     raise typer.Exit(int(_fetch_code(result)))
 
 
@@ -304,7 +364,7 @@ def parse(
     """Parse the cached pages into draft records with lineage (offline, deterministic)."""
     settings = _settings(data_dir, max_pages, max_depth)
     result = _call(settings, lambda: run_parse(settings, site))
-    typer.echo(
+    _out(
         f"parse {result.parse_run_id}: {result.records} records from {result.pages_parsed} "
         f"pages, {result.warnings} warnings"
     )
@@ -322,7 +382,7 @@ def validate(
     settings = _settings(data_dir, max_pages, max_depth)
     result = _call(settings, lambda: run_validate(settings, site))
     report = result.report
-    typer.echo(f"validate: {report.verdict.value.upper()}: {report.verdict_reason}")
+    _out(f"validate: {report.verdict.value.upper()}: {report.verdict_reason}")
     raise typer.Exit(int(ExitCode.OK if result.passed else ExitCode.VALIDATION_FAILED))
 
 
@@ -337,7 +397,7 @@ def export(
     """Write Parquet and CSV deliverables and the run report. Exit 1 if validation failed."""
     settings = _settings(data_dir, max_pages, max_depth)
     result = _call(settings, lambda: run_export(settings, site))
-    typer.echo(f"export: {result.paths.output}")
+    _out(f"export: {result.paths.output}")
     raise typer.Exit(int(ExitCode.OK if result.passed else ExitCode.VALIDATION_FAILED))
 
 
@@ -363,7 +423,7 @@ def run(
     _call(settings, lambda: run_parse(settings, site))
     validated = _call(settings, lambda: run_validate(settings, site))
     exported = _call(settings, lambda: run_export(settings, site, started_at=started_at))
-    typer.echo(exported.markdown, nl=False)
+    _out(exported.markdown, nl=False)
     if fetch_code is ExitCode.DOMAIN_STOPPED:
         raise typer.Exit(int(ExitCode.DOMAIN_STOPPED))
     raise typer.Exit(int(ExitCode.OK if validated.passed else ExitCode.VALIDATION_FAILED))
@@ -408,4 +468,4 @@ def status(
     ]
     if not runs:
         lines.append("  none yet")
-    typer.echo("\n".join(lines))
+    _out("\n".join(lines))

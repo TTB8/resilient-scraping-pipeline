@@ -18,6 +18,7 @@ from typer.testing import CliRunner, Result
 from scraping_pipeline import __version__, cli
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.types import Site
+from scraping_pipeline.fetch import playwright_fetcher
 from scraping_pipeline.fetch.fake import Step, block_page
 from scraping_pipeline.stages.fetch import FetchStageResult, run_fetch
 from scraping_pipeline.storage.state import StateStore
@@ -244,20 +245,63 @@ def test_a_crash_inside_run_exits_4_not_1(
     assert invoke("run", "--site", "quotes").exit_code == 4
 
 
-def test_a_browser_that_is_not_installed_exits_2_and_says_make_browsers(
-    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def no_chromium(*_: object, **__: object) -> None:
-        raise PlaywrightError(
-            "BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium/chrome\n"
-            "Looks like Playwright was just installed or updated. Please run: playwright install"
-        )
+class _NoBrowser:
+    """Stands in for ``async_playwright()``: the driver or Chromium fails to start."""
 
-    monkeypatch.setattr(cli, "run_fetch", no_chromium)
+    def __init__(self, start: BaseException | None, launch: BaseException | None) -> None:
+        self.start_error, self.launch_error = start, launch
+        self.chromium = self
+
+    def __call__(self) -> _NoBrowser:
+        return self
+
+    async def start(self) -> _NoBrowser:
+        if self.start_error is not None:
+            raise self.start_error
+        return self
+
+    async def launch(self, **_: object) -> None:
+        assert self.launch_error is not None
+        raise self.launch_error
+
+    async def stop(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("start", "launch", "said"),
+    [
+        (  # Chromium not installed
+            None,
+            PlaywrightError(
+                "BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium/chrome\n"
+                "Looks like Playwright was just installed or updated. Please run: playwright install"
+            ),
+            "Executable doesn't exist",
+        ),
+        (  # R3-01: the driver's bundled node cannot load a system library, so it never starts
+            Exception("Connection closed while reading from the driver"),
+            None,
+            "Connection closed while reading from the driver",
+        ),
+    ],
+)
+def test_a_browser_that_cannot_start_exits_2_and_says_how_to_install_it(
+    start: BaseException | None,
+    launch: BaseException | None,
+    said: str,
+    invoke: Callable[..., Result],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(playwright_fetcher, "async_playwright", _NoBrowser(start, launch))
+    assert invoke("discover", "--site", "quotes-js").exit_code == 0
     result = invoke("fetch", "--site", "quotes-js")
-    assert result.exit_code == 2
-    assert "run `make browsers`" in result.stderr
-    assert "Executable doesn't exist" in result.stderr
+    assert result.exit_code == 2, result.stderr
+    assert "This is a bug" not in result.stderr
+    assert "`make browsers`" in result.stderr
+    assert "install the browser's system dependencies" in result.stderr
+    assert "playwright install-deps" in result.stderr
+    assert said in result.stderr
 
 
 def test_any_other_playwright_error_is_an_internal_error(
@@ -311,6 +355,7 @@ def test_an_os_error_on_a_data_file_exits_2_with_its_path(
     assert result.exit_code == 2
     assert str(target) in result.stderr
     assert "No space left on device" in result.stderr
+    assert "--user" not in result.stderr  # not a permission problem: no Docker hint (R3-08)
 
 
 def test_an_os_error_outside_the_data_dir_is_an_internal_error(
@@ -332,6 +377,49 @@ def test_an_unopenable_state_database_exits_2_with_its_path(
     result = invoke("discover", "--site", "books")
     assert result.exit_code == 2, result.stderr
     assert str(data / "state.duckdb") in result.stderr
+    # R3-08: a corrupt file is not a permission problem, so no "run Docker as your user" hint.
+    assert "not a valid DuckDB file" in result.stderr
+    assert "--user" not in result.stderr
+    assert "Move it aside" in result.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_unreadable_state_database_gets_the_docker_hint(
+    invoke: Callable[..., Result], tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    db = data / "state.duckdb"
+    db.write_bytes(b"")
+    db.chmod(0)
+    try:
+        result = invoke("discover", "--site", "books")
+    finally:
+        db.chmod(0o600)
+    assert result.exit_code == 2, result.stderr
+    assert str(db) in result.stderr
+    assert "Permission denied" in result.stderr
+    assert '--user "$(id -u):$(id -g)"' in result.stderr
+
+
+def test_a_data_dir_that_cannot_be_used_stops_before_any_stage_runs(
+    invoke: Callable[..., Result], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # R3-07: the pre-check is what keeps a run that cannot write from starting at all (no request,
+    # no state database, no run record); the later mapping alone would only catch it mid-stage.
+    called: list[str] = []
+
+    def spy(*_: object, **__: object) -> None:
+        called.append("stage")
+
+    for name in ("run_discover", "run_fetch", "run_parse", "run_validate", "run_export"):
+        monkeypatch.setattr(cli, name, spy)
+    (tmp_path / "data").write_text("not a directory")
+    for command in ("discover", "fetch", "parse", "validate", "export", "run"):
+        result = invoke(command, "--site", "books")
+        assert result.exit_code == 2, (command, result.stderr)
+        assert "--user" not in result.stderr  # a file in the way: no Docker hint (R3-08)
+    assert called == []
 
 
 def test_status_does_not_create_a_state_database(

@@ -155,7 +155,7 @@ before any stage with exit code 2 and a message naming `/data`. CI runs this mou
 |---|---|
 | 0 | everything ran and the data passed validation |
 | 1 | validation failed: valid rows are delivered, failing rows are in `quarantine.csv`. Only this: a crash is 4 |
-| 2 | usage or environment error: a bad option or setting, a missing stage input, the state database in use, a data directory that cannot be written (the message names the path), or Chromium not installed (`make browsers`) |
+| 2 | usage or environment error: a bad option or setting, a missing stage input, the state database in use, a data directory that cannot be written (the message names the path), or a browser that is not installed or cannot start (`make browsers`; missing system libraries: `uv run playwright install-deps chromium`) |
 | 3 | a domain was stopped (blocked, a challenge, rate-limited beyond limits). The rest still ran |
 | 4 | internal error: an unexpected exception (a bug), logged with its traceback as `internal_error`. Infer nothing about the data |
 | 130 | interrupted. Progress is saved; run the same command again to resume |
