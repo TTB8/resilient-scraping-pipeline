@@ -94,6 +94,11 @@ class SiteSpec:
     Computed by parse (which may read the cache) and stored next to the drafts, so validate needs
     nothing but the parse output."""
     build_dataset: Callable[[Sequence[Candidate[Any]], dict[str, Any]], Dataset]
+    allow_scheme_downgrade: bool = False
+    """Follow a same-host ``https`` to ``http`` redirect (counted in the report), ADR 0010.
+
+    Off by default, so a new site never inherits clear-text hops silently: such a hop is then
+    refused as off-site. Turn it on only for a site seen to redirect that way."""
 
     def origin(self, settings: Settings) -> str:
         """The site's origin: links that leave it are never followed."""
@@ -194,6 +199,8 @@ SITES: dict[Site, SiteSpec] = {
         tables=(_AUTHORS_TABLE, _QUOTES_TABLE),
         build_context=_no_context,
         build_dataset=_quotes_dataset_factory(require_author_links=True),
+        # The live site answers https author URLs with 308 to http (ADR 0010).
+        allow_scheme_downgrade=True,
     ),
     # Same origin and parser as the static quotes site; the quotes only exist after the page's
     # script runs, so a real browser renders them and the parser reads the rendered DOM. The
@@ -211,6 +218,8 @@ SITES: dict[Site, SiteSpec] = {
         tables=(_QUOTES_TABLE,),
         build_context=_no_context,
         build_dataset=_quotes_dataset_factory(require_author_links=False),
+        # The same host as quotes, which redirects https to http on some paths (ADR 0010).
+        allow_scheme_downgrade=True,
     ),
 }
 

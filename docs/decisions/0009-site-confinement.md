@@ -1,8 +1,9 @@
 # 0009. The crawl is confined to its site, redirects included
 
 > **Superseded in part by [0010](0010-same-host-scheme-switch.md):** the scheduler also follows a
-> redirect that only switches between `http` and `https` on the same host (default ports), and
-> robots.txt redirects are confined by the same rule as page redirects.
+> redirect that only switches between `http` and `https` on the same host (default ports; `https`
+> to `http` only for a site that opts in), and robots.txt redirects are confined by the same rule
+> as page redirects.
 
 ## Context
 

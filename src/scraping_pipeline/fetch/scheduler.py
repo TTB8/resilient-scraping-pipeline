@@ -33,8 +33,8 @@ Redirects: the scheduler follows them, not the fetcher
 Fetchers never follow redirects. A redirect hop is a request like any other, so it must pass the
 same gates: the scheduler follows a ``301/302/303/307/308`` with a ``Location`` only when the target
 stays on the entry's site (:func:`same_site_origin`: the same origin, or a switch between ``http``
-and ``https`` on the same host when both sides use their default port, ADR 0010), robots.txt allows
-it, and the bucket and breaker let it through; at most :data:`MAX_REDIRECT_HOPS` hops per attempt.
+and ``https`` on the same host when both sides use their default port, ADR 0010; the ``https`` to
+``http`` direction only for a site that opts in), robots.txt allows it, and the bucket and breaker let it through; at most :data:`MAX_REDIRECT_HOPS` hops per attempt.
 ``Location`` is resolved with :func:`~scraping_pipeline.core.urls.resolve` (RFC 3986, empty path
 segments kept), not ``urljoin``. Anything else is a ``client_error`` (permanent, never retried)
 with the reason in the frontier: "off-site redirect to <host> refused" (another host, or another
@@ -46,8 +46,11 @@ the same way (defence in depth). This is what makes "the crawl never leaves a si
 makes the rate bound hold for requests rather than only for tokens.
 
 An ``https`` to ``http`` hop is a **downgrade**: the body crosses the network in clear text. It is
-followed (the live quotes site sends author pages to ``http``, and upgrading the hop back would
-loop), but every one is counted in ``CrawlSummary.scheme_downgrades`` so the run report can show it.
+followed only when the site opts in (``allow_scheme_downgrade``, from ``SiteSpec``: the live quotes
+site sends author pages to ``http``, and upgrading the hop back would loop); otherwise it is refused
+as off-site, like another host. Every downgrade followed is counted in
+``CrawlSummary.scheme_downgrades`` once its hop is admitted (a token and the breaker), so the run
+report can show it and a hop the domain stopped before sending is not counted.
 
 A hop's target is not checked against the frontier: if a page links both ``/author/X`` and
 ``/author/X/`` and the first redirects to the second, the same body is fetched twice and stored
@@ -251,17 +254,22 @@ def origin_of(url: str) -> tuple[str, str, int] | None:
 
 
 def same_site_origin(
-    origin: tuple[str, str, int] | None, home: tuple[str, str, int] | None
+    origin: tuple[str, str, int] | None,
+    home: tuple[str, str, int] | None,
+    *,
+    allow_downgrade: bool = False,
 ) -> bool:
     """True when a redirect to ``origin`` stays on the site whose origin is ``home``.
 
-    The same origin always does. So does a switch between ``http`` and ``https`` on the same host
-    when both sides use their scheme's default port: real sites redirect that way (the quotes
-    practice site answers ``https://.../author/X`` with ``308`` to ``http://.../author/X/``), and
-    it is the same server under the same name. A different host, or any non-default port, is
-    another site. The hop is still robots-checked against the rules already fetched for the host,
-    rate-limited and breaker-checked like every request, and an ``https`` to ``http`` hop is counted
-    as a downgrade (ADR 0010). The scheme-strict rule for links is
+    The same origin always does. So does a switch from ``http`` to ``https`` on the same host when
+    both sides use their scheme's default port, and, only with ``allow_downgrade``, the switch
+    from ``https`` to ``http``: real sites redirect that way (the quotes practice site answers
+    ``https://.../author/X`` with ``308`` to ``http://.../author/X/``), and it is the same server
+    under the same name. A site must opt in to the downgrade (``SiteSpec.allow_scheme_downgrade``),
+    so a new adapter never inherits clear-text hops silently. A different host, or any non-default
+    port, is another site. The hop is still robots-checked against the rules already fetched for the
+    host, rate-limited and breaker-checked like every request, and an ``https`` to ``http`` hop is
+    counted as a downgrade (ADR 0010). The scheme-strict rule for links is
     :func:`~scraping_pipeline.core.urls.same_site`; links found on a page reached by a scheme switch
     are resolved against the entry's origin (:func:`~scraping_pipeline.core.urls.link_base`).
     """
@@ -270,11 +278,17 @@ def same_site_origin(
     if origin == home:
         return True
     (scheme, host, port), (home_scheme, home_host, home_port) = origin, home
+    if _is_downgrade(home_scheme, scheme) and not allow_downgrade:
+        return False
     return (
         host == home_host
         and port == _DEFAULT_PORTS[scheme]
         and home_port == _DEFAULT_PORTS[home_scheme]
     )
+
+
+def _is_downgrade(from_scheme: str, to_scheme: str) -> bool:
+    return from_scheme == "https" and to_scheme == "http"
 
 
 def redirect_location(result: FetchResult) -> str | None:
@@ -314,10 +328,15 @@ class PoliteScheduler:
         rand: Rand = random.random,
         markers: BlockMarkers = DEFAULT_MARKERS,
         robots_fetcher: Fetcher | None = None,
+        allow_scheme_downgrade: bool = False,
     ) -> None:
         """``robots_fetcher`` reads robots.txt when given (a raw HTTP fetcher for a browser site;
-        see the module docstring); otherwise ``fetcher`` does. The caller owns both lifetimes."""
+        see the module docstring); otherwise ``fetcher`` does. The caller owns both lifetimes.
+
+        ``allow_scheme_downgrade`` lets a same-host ``https`` to ``http`` redirect be followed (the
+        site's ``SiteSpec`` opts in, ADR 0010). Off by default: such a hop is refused as off-site."""
         self._fetcher = fetcher
+        self._allow_downgrade = allow_scheme_downgrade
         self._robots_fetcher = robots_fetcher if robots_fetcher is not None else fetcher
         self._settings = settings
         self._sink = sink
@@ -457,6 +476,7 @@ class PoliteScheduler:
         """
         home = origin_of(entry.url)
         url = entry.url
+        previous: str | None = None  # the URL whose redirect led to ``url``
         elapsed = 0.0
         hops = 0
         while True:
@@ -464,6 +484,8 @@ class PoliteScheduler:
                 ticket = await self._admit(d)
                 if ticket is None:
                     return None
+                if previous is not None:  # the hop is admitted: it will be sent, so count it now
+                    self._count_downgrade(previous, url)
                 result = await self._fetcher.fetch(url)
             self._requests += 1
             elapsed += result.elapsed_s
@@ -471,7 +493,7 @@ class PoliteScheduler:
             if opened:
                 await self._sink.on_breaker_opened(d.name, describe(d.breaker))
             labelled = replace(result, requested_url=entry.url, final_url=url, elapsed_s=elapsed)
-            if not same_site_origin(origin_of(result.final_url), home):  # fetcher followed one
+            if not self._same_site(origin_of(result.final_url), home):  # fetcher followed one
                 return labelled, _refused(
                     f"off-site redirect to {_host_of(result.final_url)} refused"
                 )
@@ -482,9 +504,8 @@ class PoliteScheduler:
             if refusal is not None:
                 return labelled, refusal
             assert target is not None  # noqa: S101 - _next_hop returns exactly one of the two
-            self._count_downgrade(url, target)
             hops += 1
-            url = target
+            previous, url = url, target
 
     def _next_hop(
         self,
@@ -499,8 +520,10 @@ class PoliteScheduler:
             target = canonicalize(resolve(url, location))
         except InvalidUrlError:
             return None, _refused(f"redirect to {location!r} refused: not an http(s) URL")
-        if not same_site_origin(origin_of(target), home):
-            return None, _refused(f"off-site redirect to {_host_of(target)} refused")
+        if not self._same_site(origin_of(target), home):
+            return None, _refused(
+                f"off-site redirect to {_host_of(target)} refused{self._why(target, home)}"
+            )
         if hops >= MAX_REDIRECT_HOPS:
             return None, _refused(f"redirect loop: more than {MAX_REDIRECT_HOPS} hops, at {target}")
         if not policy.can_fetch(self._settings.user_agent, target):
@@ -535,9 +558,22 @@ class PoliteScheduler:
             else:  # half-open: the probe is out; its result will poke us
                 await self._nap(d, None)
 
+    def _same_site(
+        self, origin: tuple[str, str, int] | None, home: tuple[str, str, int] | None
+    ) -> bool:
+        return same_site_origin(origin, home, allow_downgrade=self._allow_downgrade)
+
+    def _why(self, target: str, home: tuple[str, str, int] | None) -> str:
+        """The reason suffix for a hop refused only because it is a downgrade the site forbids."""
+        if not self._allow_downgrade and same_site_origin(
+            origin_of(target), home, allow_downgrade=True
+        ):
+            return ": https to http downgrade not allowed for this site"
+        return ""
+
     def _count_downgrade(self, url: str, target: str) -> None:
-        """Count a followed hop from ``https`` to ``http`` (ADR 0010)."""
-        if urlsplit(url).scheme == "https" and urlsplit(target).scheme == "http":
+        """Count an admitted hop from ``https`` to ``http`` (ADR 0010)."""
+        if _is_downgrade(urlsplit(url).scheme, urlsplit(target).scheme):
             self._downgrades += 1
 
     def _observe(self, d: _Domain, result: FetchResult, ticket: int) -> tuple[Classification, bool]:
@@ -637,10 +673,13 @@ class PoliteScheduler:
         is another server, and its rules must not govern this site.
         """
         url = d.robots_url
+        previous: str | None = None
         home = origin_of(d.robots_url)
         hops = 0
         while True:
             await self._take_token(d)
+            if previous is not None:  # admitted (robots.txt only waits for a token): counted
+                self._count_downgrade(previous, url)
             result = await self._robots_fetcher.fetch(url)
             self._requests += 1
             labelled = replace(result, requested_url=d.robots_url, final_url=url)
@@ -651,13 +690,15 @@ class PoliteScheduler:
                 target = canonicalize(resolve(url, location))
             except InvalidUrlError:
                 return labelled, f"redirect to {location!r} refused: not an http(s) URL"
-            if not same_site_origin(origin_of(target), home):
-                return labelled, f"redirect to {urlsplit(target).netloc} refused"
+            if not self._same_site(origin_of(target), home):
+                return (
+                    labelled,
+                    f"redirect to {urlsplit(target).netloc} refused{self._why(target, home)}",
+                )
             if hops >= MAX_REDIRECT_HOPS:
                 return labelled, f"redirect loop: more than {MAX_REDIRECT_HOPS} hops"
-            self._count_downgrade(url, target)
             hops += 1
-            url = target
+            previous, url = url, target
 
     async def _take_token(self, d: _Domain) -> None:
         while True:

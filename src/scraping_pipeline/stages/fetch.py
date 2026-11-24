@@ -416,7 +416,12 @@ def run_fetch(
                 if robots is not None:
                     robots = await stack.enter_async_context(robots)
                 scheduler = PoliteScheduler(
-                    fetcher, settings, sink, robots_fetcher=robots, **options
+                    fetcher,
+                    settings,
+                    sink,
+                    robots_fetcher=robots,
+                    allow_scheme_downgrade=spec.allow_scheme_downgrade,
+                    **options,
                 )
                 return await scheduler.run(feeder.entries())
 

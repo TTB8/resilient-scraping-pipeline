@@ -1,4 +1,4 @@
-# 0010. A same-host http<->https redirect is followed, and every downgrade is counted
+# 0010. A same-host http<->https redirect is followed (https to http per site), and every downgrade is counted
 
 Supersedes the part of [0009](0009-site-confinement.md) that confines redirects to the entry's
 exact origin.
@@ -19,8 +19,9 @@ dropped by the scheme-strict link rule, and robots.txt redirects were checked by
 
 - **A redirect stays on the site** when the target has the entry's origin, or when it only
   switches between `http` and `https` on the same host with both sides on their scheme's default
-  port (`same_site_origin` in `fetch/scheduler.py`). Another host, or any non-default port, is
-  still another site and is refused permanently.
+  port (`same_site_origin` in `fetch/scheduler.py`). The `https` to `http` direction needs the
+  site's opt-in (see "Per-site opt-in" below). Another host, or any non-default port, is still
+  another site and is refused permanently.
 - **robots.txt redirects use the same rule.** Another port on the same host is another server,
   and its rules must not govern this site.
 - **The downgrade is followed, not upgraded.** An `https` to `http` hop is not rewritten back to
@@ -50,6 +51,20 @@ dropped by the scheme-strict link rule, and robots.txt redirects were checked by
 
 - **Keep 0009 as written.** Correct on paper, but it fails every author page of a real target.
 - **Upgrade the downgrade hop to `https`.** Loops on the target that motivated the change.
+  Upgrading and then falling back to `http` would not loop, but it doubles the requests for every
+  such page (about 50 more on the full quotes crawl) and ends in clear text anyway.
 - **Treat `http` and `https` as one origin for links too.** It would plan both spellings of every
   page and fetch each twice. Rebasing the links of a switched page onto the entry's origin keeps
   one spelling per page.
+
+## Per-site opt-in (amendment, third review)
+
+Following the downgrade was first a global rule, so a new site adapter would have inherited
+clear-text hops without anyone deciding it. It is now a per-site capability:
+`SiteSpec.allow_scheme_downgrade`, `False` by default, `True` for `quotes` and `quotes-js` only (the
+host that was seen to redirect that way). For any other site, `books` included, a same-host `https`
+to `http` redirect is refused as off-site, as under 0009: a permanent `client_error` whose reason
+ends "https to http downgrade not allowed for this site", and for robots.txt a stopped domain.
+An `http` to `https` upgrade on the same host stays allowed for every site. A downgrade is counted
+only once its hop is admitted (a token and the breaker), so a hop the domain stopped before sending
+is not counted.

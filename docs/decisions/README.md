@@ -14,7 +14,7 @@ They are short on purpose: a reader should be able to disagree with one in five 
 | [0007](0007-pure-core-injected-time.md) | A pure core: clocks, randomness and I/O are injected | Accepted |
 | [0008](0008-duckdb-run-state.md) | DuckDB holds the run state; the frontier is the source of truth for progress | Accepted |
 | [0009](0009-site-confinement.md) | The crawl is confined to its site, redirects included | Accepted; superseded in part by 0010 |
-| [0010](0010-same-host-scheme-switch.md) | A same-host http<->https redirect is followed, and every downgrade is counted | Accepted |
+| [0010](0010-same-host-scheme-switch.md) | A same-host http<->https redirect is followed (https to http per site), and every downgrade is counted | Accepted |
 
 New record: copy the shape of an existing one, take the next number, and link it here. A record is
 never edited to reverse itself; a later record supersedes it.

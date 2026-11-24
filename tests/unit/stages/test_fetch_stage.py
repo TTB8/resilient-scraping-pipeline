@@ -23,7 +23,7 @@ from scraping_pipeline.fetch.fake import (
     rate_limited,
     server_error,
 )
-from scraping_pipeline.sites import SiteSpec
+from scraping_pipeline.sites import SITES, SiteSpec
 from scraping_pipeline.stages import run_discover
 from scraping_pipeline.stages.fetch import FetchTiming, _Feeder, run_fetch
 from scraping_pipeline.storage.cache import PageCache
@@ -479,3 +479,34 @@ async def test_feeder_waits_for_outstanding_entries_and_feeds_their_links() -> N
     feeder.settle("https://h/b")
     with pytest.raises(StopAsyncIteration):
         await ending
+
+
+# --- round 3: the https to http hop is a per-site opt-in (R3-06, ADR 0010) -----------------------
+
+
+def test_only_the_quotes_sites_opt_in_to_scheme_downgrades() -> None:
+    assert {s for s, spec in SITES.items() if spec.allow_scheme_downgrade} == {
+        Site.QUOTES,
+        Site.QUOTES_JS,
+    }
+
+
+def test_books_refuses_a_same_host_downgrade_as_off_site(tmp_path: Path) -> None:
+    books_home = "https://books.toscrape.com/"
+    settings = stage_settings(tmp_path)
+    run_discover(settings, Site.BOOKS)
+    factory, log = saved_site_fetcher(
+        "books",
+        {
+            books_home: Respond(308, b"", {"location": "http://books.toscrape.com/"}),
+            "http://books.toscrape.com/": ok(_NEXT_ONLY),
+        },
+    )
+    result = fast_fetch(settings, Site.BOOKS, factory)
+    assert "http://books.toscrape.com/" not in log.urls()  # never sent in clear text
+    assert result.scheme_downgrades == 0
+    with StateStore.open(settings.state_db) as store:
+        entry = store.get(books_home)
+    assert entry is not None
+    assert entry.status is FrontierStatus.FAILED_PERMANENT
+    assert "https to http downgrade not allowed for this site" in (entry.last_reason or "")

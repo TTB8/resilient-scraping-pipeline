@@ -56,9 +56,12 @@ class Crawl:
         scripts: Mapping[str, Step | list[Step]] | None = None,
         *,
         robots: Mapping[str, Step | list[Step]] | None = None,
+        allow_downgrade: bool = False,
         **settings: Any,
     ):
-        """``robots``: give the scheduler a separate robots.txt fetcher with these scripts."""
+        """``robots``: give the scheduler a separate robots.txt fetcher with these scripts.
+
+        ``allow_downgrade``: the site opts in to same-host https to http hops (ADR 0010)."""
         self.vt = VirtualTime()
         self.fake = FakeFetcher(scripts, sleep=self.vt.sleep, clock=self.vt.clock)
         self.robots_fake = (
@@ -77,6 +80,7 @@ class Crawl:
             sleep=self.vt.sleep,
             rand=lambda: 0.5,
             robots_fetcher=self.robots_fake,
+            allow_scheme_downgrade=allow_downgrade,
         )
 
     async def run(self, urls: list[str]) -> CrawlSummary:
@@ -698,7 +702,10 @@ async def test_same_host_scheme_switch_on_default_ports_is_followed() -> None:
     # The live quotes site answers https://.../author/X with 308 to http://.../author/X/ (seen on
     # the first real run; the saved fixtures already had the slash, so only a live run showed it).
     target = "http://quotes.example.test/author/X/"
-    crawl = Crawl({u("/author/X"): redirect(target, status=308), target: ok("<html>author</html>")})
+    crawl = Crawl(
+        {u("/author/X"): redirect(target, status=308), target: ok("<html>author</html>")},
+        allow_downgrade=True,  # the quotes sites opt in (SiteSpec.allow_scheme_downgrade)
+    )
     summary = await crawl.run([u("/author/X")])
 
     assert crawl.fake.urls_called() == [ROBOTS, u("/author/X"), target]
@@ -899,7 +906,10 @@ async def test_robots_redirect_to_another_port_on_the_same_host_is_refused(
 async def test_robots_same_host_scheme_switch_is_followed_and_counted() -> None:
     target = "http://quotes.example.test/robots.txt"
     rules = ok("User-agent: *\nDisallow: /private/\n", content_type="text/plain")
-    crawl = Crawl({ROBOTS: redirect(target, 308), target: rules, u("/private/x"): ok()})
+    crawl = Crawl(
+        {ROBOTS: redirect(target, 308), target: rules, u("/private/x"): ok()},
+        allow_downgrade=True,
+    )
     summary = await crawl.run([u("/private/x")])
     assert crawl.fake.urls_called() == [ROBOTS, target]
     assert crawl.sink.finals()[u("/private/x")].status is FrontierStatus.SKIPPED_ROBOTS
@@ -941,7 +951,8 @@ async def test_only_https_to_http_hops_count_as_downgrades() -> None:
             u("/b"): ok(),
             u("/up", up_home): redirect(u("/up/")),  # http -> https: an upgrade
             u("/up/"): ok(),
-        }
+        },
+        allow_downgrade=True,
     )
     summary = await crawl.vt.run(
         crawl.scheduler.run([entry(u("/author/X")), entry(u("/a")), entry(u("/up", up_home))])
@@ -1003,3 +1014,81 @@ async def test_breaker_opening_is_reported_once_per_opening() -> None:
 )
 def test_origin_of(url: str, origin: tuple[str, str, int] | None) -> None:
     assert origin_of(url) == origin
+
+
+# --- round 3: a downgrade is counted once its hop is admitted (R3-03) ----------------------------
+
+
+async def test_a_downgrade_hop_the_domain_stops_before_sending_is_not_counted() -> None:
+    # t=0 robots.txt; t=1 /slow-block goes out and answers 403 at t=2.5; t=2 /author/X answers 308
+    # to http. Its hop waits for the t=3 token, but the domain stopped at t=2.5: never sent.
+    down = "http://quotes.example.test/author/X/"
+    crawl = Crawl(
+        {
+            u("/slow-block"): slow(block_page(), 1.5),
+            u("/author/X"): redirect(down, 308),
+            down: ok(),
+        },
+        allow_downgrade=True,
+        max_concurrency_per_domain=2,
+    )
+    summary = await crawl.run([u("/slow-block"), u("/author/X")])
+    assert crawl.fake.urls_called() == [ROBOTS, u("/slow-block"), u("/author/X")]
+    assert "quotes.example.test" in summary.domains_stopped
+    assert summary.scheme_downgrades == 0  # the clear-text request was never made
+
+
+# --- round 3: the https to http hop is a per-site opt-in (R3-06, ADR 0010) -----------------------
+
+
+async def test_without_the_opt_in_a_same_host_downgrade_is_refused_as_off_site() -> None:
+    down = "http://quotes.example.test/author/X/"
+    crawl = Crawl({u("/author/X"): redirect(down, 308), down: ok()})
+    summary = await crawl.run([u("/author/X")])
+    assert crawl.fake.urls_called() == [ROBOTS, u("/author/X")]  # never sent in clear text
+    final = crawl.sink.finals()[u("/author/X")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT
+    assert final.last_class is ResponseClass.CLIENT_ERROR
+    assert final.last_reason is not None
+    assert "off-site redirect to quotes.example.test refused" in final.last_reason
+    assert "https to http downgrade not allowed for this site" in final.last_reason
+    assert summary.scheme_downgrades == 0
+
+
+async def test_with_the_opt_in_the_same_downgrade_is_followed_and_counted() -> None:
+    down = "http://quotes.example.test/author/X/"
+    crawl = Crawl({u("/author/X"): redirect(down, 308), down: ok()}, allow_downgrade=True)
+    summary = await crawl.run([u("/author/X")])
+    assert crawl.fake.urls_called() == [ROBOTS, u("/author/X"), down]
+    assert crawl.sink.finals()[u("/author/X")].status is FrontierStatus.DONE
+    assert summary.scheme_downgrades == 1
+
+
+async def test_without_the_opt_in_an_upgrade_is_still_followed() -> None:
+    home = "http://quotes.example.test"
+    crawl = Crawl({u("/up", home): redirect(u("/up/")), u("/up/"): ok()})
+    summary = await crawl.vt.run(crawl.scheduler.run([entry(u("/up", home))]))
+    assert crawl.sink.finals()[u("/up", home)].status is FrontierStatus.DONE
+    assert summary.scheme_downgrades == 0
+
+
+async def test_without_the_opt_in_a_fetcher_that_followed_a_downgrade_is_refused() -> None:
+    page = Respond(200, b"<html>x</html>", final_url="http://quotes.example.test/a")
+    crawl = Crawl({u("/a"): page})
+    await crawl.run([u("/a")])
+    final = crawl.sink.finals()[u("/a")]
+    assert final.status is FrontierStatus.FAILED_PERMANENT
+    assert "off-site redirect to quotes.example.test refused" in (final.last_reason or "")
+
+
+async def test_without_the_opt_in_a_robots_downgrade_stops_the_domain() -> None:
+    target = "http://quotes.example.test/robots.txt"
+    rules = ok("User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: redirect(target, 308), target: rules, u("/a"): ok()})
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.urls_called() == [ROBOTS]
+    assert summary.domains_stopped["quotes.example.test"] == (
+        "robots.txt unreachable: redirect to quotes.example.test refused: "
+        "https to http downgrade not allowed for this site"
+    )
+    assert summary.scheme_downgrades == 0
