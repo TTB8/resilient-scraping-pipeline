@@ -56,9 +56,13 @@ jobs:
         env:
           # Fail, don't skip, if Chromium can't launch: a broken install must not hide the JS tests.
           REQUIRE_BROWSER_TESTS: '1'
-        run: uv run pytest --cov --cov-report=term --cov-report=xml
+        run: uv run pytest -n auto --cov --cov-report=term --cov-report=xml
       - name: Core coverage gate (>= 90%)
         run: uv run coverage report --include='src/scraping_pipeline/core/*' --fail-under=90
+      - name: Stages, sites and CLI coverage gate (>= 90%)
+        run: >-
+          uv run coverage report --fail-under=90
+          --include='src/scraping_pipeline/stages/*,src/scraping_pipeline/sites/*,src/scraping_pipeline/cli.py'
       - name: Coverage summary
         if: always()
         run: |
