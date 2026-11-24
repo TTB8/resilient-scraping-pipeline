@@ -70,8 +70,10 @@ import asyncio
 import time
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from scraping_pipeline.config import Settings
@@ -109,6 +111,7 @@ _STORABLE_STATUS = range(100, 600)
 
 Runner = Callable[[Coroutine[Any, Any, Any]], Any]
 FetcherFactory = Callable[[], Fetcher]
+RobotsFetcherFactory = Callable[[], Fetcher | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,9 @@ class FetchStageResult:
     stopped_domains: dict[str, str]
     """Domains with ``stopped`` entries after the run (this run's stops or earlier ones)."""
     interrupted: bool
+    scheme_downgrades: int | None = 0
+    """Redirect hops followed from ``https`` to ``http`` (ADR 0010), from the scheduler's
+    summary; ``None`` when the run was interrupted before it could report."""
 
 
 class _Feeder:
@@ -301,6 +307,20 @@ class _StoreSink:
         self._store.record_result(self._run_id, entry, new_entry, None)
         self._feeder.settle(entry.url)
 
+    async def on_breaker_opened(self, domain: str, reason: str) -> None:
+        self._store.record_domain_event(
+            DomainEvent(
+                run_id=self._run_id,
+                site=self._spec.site,
+                domain=domain,
+                event=DomainEventKind.BREAKER_OPENED,
+                reason=reason,
+                at=self._wall(),
+                response_class=self._last_class.get(domain),
+            )
+        )
+        log.warning("breaker_opened", domain=domain, reason=reason)
+
     async def on_domain_stopped(self, domain: str, reason: str) -> None:
         self.domains_stopped[domain] = reason
         self._store.record_domain_event(
@@ -315,6 +335,10 @@ class _StoreSink:
             )
         )
         log.warning("domain_stopped", domain=domain, reason=reason)
+
+
+def _no_fetcher() -> Fetcher | None:
+    return None
 
 
 def _pending(store: StateStore, site: Site) -> list[FrontierEntry]:
@@ -332,20 +356,31 @@ def run_fetch(
     *,
     retry_failed: bool = False,
     fetcher_factory: FetcherFactory | None = None,
+    robots_fetcher_factory: RobotsFetcherFactory | None = None,
     timing: FetchTiming | None = None,
     runner: Runner = asyncio.run,
 ) -> FetchStageResult:
     """Fetch every pending entry of ``site``; see the module docstring for the steps.
 
-    ``fetcher_factory`` defaults to the site's fetcher (``SiteSpec.make_fetcher``); ``timing`` and
-    ``runner`` exist for tests (a scripted fetcher, a virtual clock). Returns normally on Ctrl-C
-    with ``interrupted=True``.
+    ``fetcher_factory`` defaults to the site's fetcher (``SiteSpec.make_fetcher``).
+    ``robots_fetcher_factory`` builds the robots.txt fetcher (``None`` from it: the page fetcher
+    reads robots.txt); it defaults to ``SiteSpec.make_robots_fetcher`` when ``fetcher_factory`` is
+    not given, and to "the page fetcher" when it is, so a scripted fetcher scripts robots.txt too.
+    ``timing`` and ``runner`` exist for tests (a scripted fetcher, a virtual clock). Returns
+    normally on Ctrl-C with ``interrupted=True``.
     """
     spec = get_site(site)
     cache = PageCache(settings.cache_dir)
     timing = timing or FetchTiming()
     wall = timing.wall_clock or time.time
     factory = fetcher_factory or (lambda: spec.make_fetcher(settings))
+    robots_factory: RobotsFetcherFactory
+    if robots_fetcher_factory is not None:
+        robots_factory = robots_fetcher_factory
+    elif fetcher_factory is None:
+        robots_factory = partial(spec.make_robots_fetcher, settings)
+    else:
+        robots_factory = _no_fetcher
     with (
         StateStore.open(settings.state_db) as store,
         stage_run(store, settings, site, Stage.FETCH, run_id=new_run_id(Stage.FETCH)) as run,
@@ -375,8 +410,14 @@ def run_fetch(
                 for name in ("clock", "wall_clock", "sleep", "rand")
                 if (value := getattr(timing, name)) is not None
             }
-            async with factory() as fetcher:
-                scheduler = PoliteScheduler(fetcher, settings, sink, **options)
+            async with AsyncExitStack() as stack:
+                fetcher = await stack.enter_async_context(factory())
+                robots = robots_factory()
+                if robots is not None:
+                    robots = await stack.enter_async_context(robots)
+                scheduler = PoliteScheduler(
+                    fetcher, settings, sink, robots_fetcher=robots, **options
+                )
                 return await scheduler.run(feeder.entries())
 
         interrupted = False
@@ -399,6 +440,9 @@ def run_fetch(
             domains_stopped_now=dict(sorted((sink.domains_stopped if sink else {}).items())),
             stopped_domains=stopped_domains(store, site),
             interrupted=interrupted,
+            scheme_downgrades=(
+                summary.scheme_downgrades if summary is not None else (None if interrupted else 0)
+            ),
         )
         run.status = RunStatus.INTERRUPTED if interrupted else RunStatus.SUCCEEDED
         run.summary = {
@@ -413,5 +457,6 @@ def run_fetch(
             "domains_stopped_now": result.domains_stopped_now,
             "stopped_domains": result.stopped_domains,
             "interrupted": interrupted,
+            "scheme_downgrades": result.scheme_downgrades,
         }
     return result

@@ -3,8 +3,12 @@
 The scheduler is the glue between I/O and the pure rules in ``core/``. It holds per-domain state and
 calls the rules; it never re-decides anything they already decide:
 
-* ``core.robots``: robots.txt is read **once per domain per run**, through the same fetcher and the
-  same politeness budget as every other request, *before* any other request to that domain. Once,
+* ``core.robots``: robots.txt is read **once per domain per run**, under the same politeness budget
+  as every other request (a token per attempt and per hop), *before* any other request to that
+  domain. It is read with a raw HTTP fetcher, never through a browser: a browser would wait for a
+  page selector on a text file, or hand back Chromium's text viewer markup, which parses as no
+  rules at all. So a browser site passes ``robots_fetcher`` (an ``HttpxFetcher`` with the same
+  User-Agent); otherwise the page fetcher reads it. Once,
   because the rules must not change halfway through a run (a URL allowed at minute one and refused
   at minute ten makes the output depend on timing), and because re-reading robots.txt for every URL
   would double the load we put on the site. "Once" means one *answer*: a 5xx, 429 or network
@@ -28,15 +32,28 @@ Redirects: the scheduler follows them, not the fetcher
 
 Fetchers never follow redirects. A redirect hop is a request like any other, so it must pass the
 same gates: the scheduler follows a ``301/302/303/307/308`` with a ``Location`` only when the target
-is on the **same origin** as the entry (scheme, host and port), robots.txt allows it, and the bucket
-and breaker let it through; at most :data:`MAX_REDIRECT_HOPS` hops per attempt. Anything else is a
-``client_error`` (permanent, never retried) with the reason in the frontier: "off-site redirect to
-<host> refused" (another host, scheme or port, which also covers internal and metadata addresses
-such as ``169.254.169.254``), "redirect loop" (too many hops), or a robots.txt refusal of the target.
-The body is stored under the entry's URL, and ``FetchResult.final_url`` records where it came from.
-A fetcher that reports a ``final_url`` on another origin anyway is refused the same way (defence in
-depth). This is what makes "the crawl never leaves a site" true, and what makes the rate bound hold
-for requests rather than only for tokens.
+stays on the entry's site (:func:`same_site_origin`: the same origin, or a switch between ``http``
+and ``https`` on the same host when both sides use their default port, ADR 0010), robots.txt allows
+it, and the bucket and breaker let it through; at most :data:`MAX_REDIRECT_HOPS` hops per attempt.
+``Location`` is resolved with :func:`~scraping_pipeline.core.urls.resolve` (RFC 3986, empty path
+segments kept), not ``urljoin``. Anything else is a ``client_error`` (permanent, never retried)
+with the reason in the frontier: "off-site redirect to <host> refused" (another host, or another
+port, which also covers internal and metadata addresses such as ``169.254.169.254``), "redirect
+loop" (too many hops), or a robots.txt refusal of the target. robots.txt's own redirects are
+confined by the same rule. The body is stored under the entry's URL, and ``FetchResult.final_url``
+records where it came from. A fetcher that reports a ``final_url`` off the site anyway is refused
+the same way (defence in depth). This is what makes "the crawl never leaves a site" true, and what
+makes the rate bound hold for requests rather than only for tokens.
+
+An ``https`` to ``http`` hop is a **downgrade**: the body crosses the network in clear text. It is
+followed (the live quotes site sends author pages to ``http``, and upgrading the hop back would
+loop), but every one is counted in ``CrawlSummary.scheme_downgrades`` so the run report can show it.
+
+A hop's target is not checked against the frontier: if a page links both ``/author/X`` and
+``/author/X/`` and the first redirects to the second, the same body is fetched twice and stored
+under two keys. Skipping the hop would need a "duplicate of" final state the frontier does not
+have, and the scheduler only knows this run's entries, not earlier runs'. Validation's uniqueness
+rule catches the duplicate loudly (one copy is quarantined), so it cannot pass silently.
 
 Why a blocked domain is stopped, not retried
 --------------------------------------------
@@ -91,7 +108,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mappin
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.circuit import (
@@ -123,7 +140,7 @@ from scraping_pipeline.core.ratelimit import (
 from scraping_pipeline.core.retry import BackoffPolicy, RetryAction, decide
 from scraping_pipeline.core.robots import RobotsPolicy
 from scraping_pipeline.core.types import FrontierStatus, ResponseClass
-from scraping_pipeline.core.urls import InvalidUrlError, canonicalize
+from scraping_pipeline.core.urls import InvalidUrlError, canonicalize, resolve
 from scraping_pipeline.core.urls import domain as domain_of
 from scraping_pipeline.fetch.protocol import Fetcher, FetchResult
 
@@ -167,6 +184,11 @@ class FetchSink(Protocol):
         """``domain`` was stopped for the rest of the run (emitted once, before its entries are
         marked ``stopped``)."""
 
+    async def on_breaker_opened(self, domain: str, reason: str) -> None:
+        """``domain``'s breaker just opened (from closed, or again after a failed probe): no request
+        goes to it until the cooldown ends. ``reason`` is the breaker's own description. A breaker
+        that trips is reported as ``on_domain_stopped`` instead."""
+
 
 @dataclass(frozen=True, slots=True)
 class CrawlSummary:
@@ -174,6 +196,8 @@ class CrawlSummary:
 
     ``attempts`` counts page attempts (what the frontier records); ``requests`` counts every HTTP
     request sent, robots.txt attempts and redirect hops included (what the site sees).
+    ``scheme_downgrades`` counts the redirect hops followed from ``https`` to ``http`` on the same
+    host (pages and robots.txt): each sent a request in clear text (ADR 0010).
     """
 
     attempts: int
@@ -183,6 +207,7 @@ class CrawlSummary:
     domains_stopped: Mapping[str, str]
     robots: Mapping[str, str]
     duplicates_ignored: int
+    scheme_downgrades: int = 0
 
 
 @dataclass(slots=True)
@@ -235,7 +260,10 @@ def same_site_origin(
     practice site answers ``https://.../author/X`` with ``308`` to ``http://.../author/X/``), and
     it is the same server under the same name. A different host, or any non-default port, is
     another site. The hop is still robots-checked against the rules already fetched for the host,
-    rate-limited and breaker-checked like every request.
+    rate-limited and breaker-checked like every request, and an ``https`` to ``http`` hop is counted
+    as a downgrade (ADR 0010). The scheme-strict rule for links is
+    :func:`~scraping_pipeline.core.urls.same_site`; links found on a page reached by a scheme switch
+    are resolved against the entry's origin (:func:`~scraping_pipeline.core.urls.link_base`).
     """
     if origin is None or home is None:
         return False
@@ -285,8 +313,12 @@ class PoliteScheduler:
         sleep: Sleep = asyncio.sleep,
         rand: Rand = random.random,
         markers: BlockMarkers = DEFAULT_MARKERS,
+        robots_fetcher: Fetcher | None = None,
     ) -> None:
+        """``robots_fetcher`` reads robots.txt when given (a raw HTTP fetcher for a browser site;
+        see the module docstring); otherwise ``fetcher`` does. The caller owns both lifetimes."""
         self._fetcher = fetcher
+        self._robots_fetcher = robots_fetcher if robots_fetcher is not None else fetcher
         self._settings = settings
         self._sink = sink
         self._clock = clock
@@ -310,6 +342,7 @@ class PoliteScheduler:
         self._seen: set[str] = set()
         self._attempts = 0
         self._requests = 0
+        self._downgrades = 0
         self._by_class: Counter[ResponseClass] = Counter()
         self._final: Counter[FrontierStatus] = Counter()
         self._duplicates = 0
@@ -352,6 +385,7 @@ class PoliteScheduler:
                 {d.name: d.policy.reason for d in self._domains.values() if d.policy is not None}
             ),
             duplicates_ignored=self._duplicates,
+            scheme_downgrades=self._downgrades,
         )
 
     # --- intake ------------------------------------------------------------------------------
@@ -433,7 +467,9 @@ class PoliteScheduler:
                 result = await self._fetcher.fetch(url)
             self._requests += 1
             elapsed += result.elapsed_s
-            verdict = self._observe(d, result, ticket)
+            verdict, opened = self._observe(d, result, ticket)
+            if opened:
+                await self._sink.on_breaker_opened(d.name, describe(d.breaker))
             labelled = replace(result, requested_url=entry.url, final_url=url, elapsed_s=elapsed)
             if not same_site_origin(origin_of(result.final_url), home):  # fetcher followed one
                 return labelled, _refused(
@@ -446,6 +482,7 @@ class PoliteScheduler:
             if refusal is not None:
                 return labelled, refusal
             assert target is not None  # noqa: S101 - _next_hop returns exactly one of the two
+            self._count_downgrade(url, target)
             hops += 1
             url = target
 
@@ -459,7 +496,7 @@ class PoliteScheduler:
     ) -> tuple[str | None, Classification | None]:
         """Where a redirect from ``url`` may go, or why it may not."""
         try:
-            target = canonicalize(urljoin(url, location))
+            target = canonicalize(resolve(url, location))
         except InvalidUrlError:
             return None, _refused(f"redirect to {location!r} refused: not an http(s) URL")
         if not same_site_origin(origin_of(target), home):
@@ -498,8 +535,16 @@ class PoliteScheduler:
             else:  # half-open: the probe is out; its result will poke us
                 await self._nap(d, None)
 
-    def _observe(self, d: _Domain, result: FetchResult, ticket: int) -> Classification:
-        """Classify one HTTP request and feed it to the breaker and the bucket."""
+    def _count_downgrade(self, url: str, target: str) -> None:
+        """Count a followed hop from ``https`` to ``http`` (ADR 0010)."""
+        if urlsplit(url).scheme == "https" and urlsplit(target).scheme == "http":
+            self._downgrades += 1
+
+    def _observe(self, d: _Domain, result: FetchResult, ticket: int) -> tuple[Classification, bool]:
+        """Classify one HTTP request and feed it to the breaker and the bucket.
+
+        Also returns whether this result just opened the breaker (it was not open before).
+        """
         verdict = classify(
             result.status,
             result.headers,
@@ -510,13 +555,15 @@ class PoliteScheduler:
         )
         response_class = verdict.response_class
         now = self._clock()
+        was_open = d.breaker.phase is BreakerPhase.OPEN
         d.breaker = record(d.breaker, response_class, now, sent_in=ticket)
+        opened = not was_open and d.breaker.phase is BreakerPhase.OPEN
         if response_class is ResponseClass.RATE_LIMITED:
             d.bucket = slow_down(d.bucket, now=now)
         elif response_class is ResponseClass.OK:
             d.bucket = speed_up(d.bucket)
         d.poke()
-        return verdict
+        return verdict, opened
 
     async def _record_attempt(
         self, d: _Domain, entry: FrontierEntry, result: FetchResult, verdict: Classification
@@ -584,26 +631,31 @@ class PoliteScheduler:
             await self._sleep(decision.delay_s)
 
     async def _fetch_robots_once(self, d: _Domain) -> tuple[FetchResult, str | None]:
-        """One robots.txt fetch, following same-host redirects (at most five, each a request)."""
+        """One robots.txt fetch, following on-site redirects (at most five, each a request).
+
+        A hop is confined like a page hop (:func:`same_site_origin`): another port on the same host
+        is another server, and its rules must not govern this site.
+        """
         url = d.robots_url
-        home_host = _host_of(d.robots_url).lower()
+        home = origin_of(d.robots_url)
         hops = 0
         while True:
             await self._take_token(d)
-            result = await self._fetcher.fetch(url)
+            result = await self._robots_fetcher.fetch(url)
             self._requests += 1
             labelled = replace(result, requested_url=d.robots_url, final_url=url)
             location = redirect_location(result)
             if location is None:
                 return labelled, None
             try:
-                target = canonicalize(urljoin(url, location))
+                target = canonicalize(resolve(url, location))
             except InvalidUrlError:
                 return labelled, f"redirect to {location!r} refused: not an http(s) URL"
-            if _host_of(target).lower() != home_host:
-                return labelled, f"redirect to {_host_of(target)} refused"
+            if not same_site_origin(origin_of(target), home):
+                return labelled, f"redirect to {urlsplit(target).netloc} refused"
             if hops >= MAX_REDIRECT_HOPS:
                 return labelled, f"redirect loop: more than {MAX_REDIRECT_HOPS} hops"
+            self._count_downgrade(url, target)
             hops += 1
             url = target
 

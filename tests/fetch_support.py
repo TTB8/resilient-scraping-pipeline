@@ -142,6 +142,9 @@ class RecordingSink:
     async def on_domain_stopped(self, domain: str, reason: str) -> None:
         self.events.append(Event("stopped", self._now(), domain=domain, reason=reason))
 
+    async def on_breaker_opened(self, domain: str, reason: str) -> None:
+        self.events.append(Event("breaker", self._now(), domain=domain, reason=reason))
+
     # --- views -------------------------------------------------------------------------------
 
     def of(self, kind: str) -> list[Event]:

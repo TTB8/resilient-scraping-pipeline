@@ -1,5 +1,9 @@
 # 0009. The crawl is confined to its site, redirects included
 
+> **Superseded in part by [0010](0010-same-host-scheme-switch.md):** the scheduler also follows a
+> redirect that only switches between `http` and `https` on the same host (default ports), and
+> robots.txt redirects are confined by the same rule as page redirects.
+
 ## Context
 
 The first independent review found that redirects were followed by the HTTP client to any host,
@@ -9,8 +13,9 @@ the circuit breaker, so two promises the code made in writing ("the crawl never 
 
 ## Decision
 
-- **Fetchers never follow redirects.** httpx runs with `follow_redirects=False`. Playwright aborts a
-  redirected navigation and reports the 3xx.
+- **Fetchers never follow redirects.** httpx runs with `follow_redirects=False`. Playwright
+  fetches the top-level document with `max_redirects=0`, so Chromium never follows a redirect and
+  the 3xx comes back to the scheduler.
 - **The scheduler follows them itself**, and only within the entry's **origin** (scheme, host and
   effective port). Every hop is robots-checked and takes a token from the bucket and a ticket from
   the breaker, like any other request. A chain is capped at five hops.

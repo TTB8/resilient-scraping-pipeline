@@ -109,6 +109,16 @@ class SiteSpec:
             return PlaywrightFetcher(settings, self.wait_for_selector, markers=DEFAULT_MARKERS)
         return HttpxFetcher(settings)
 
+    def make_robots_fetcher(self, settings: Settings) -> Fetcher | None:
+        """A raw HTTP fetcher for robots.txt when the page fetcher is a browser, else ``None``.
+
+        robots.txt is a text file, not a page: through a browser it would wait for
+        ``wait_for_selector`` and time out (the domain stops), or come back as the text viewer's
+        HTML, which parses as no rules (fail open). ``None`` means the page fetcher reads it. The
+        ``HttpxFetcher`` sends the same User-Agent, and the scheduler charges it the same tokens.
+        """
+        return HttpxFetcher(settings) if self.fetcher == "playwright" else None
+
     def table_for(self, record: BaseModel) -> TableSpec:
         for table in self.tables:
             if isinstance(record, table.model):

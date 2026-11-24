@@ -13,7 +13,9 @@ Rules worth knowing:
 * only transient classes count as failures (``server_error``, ``timeout``, ``network_error``,
   ``rate_limited``). ``not_found`` and ``client_error`` are answers, not outages: they neither count
   nor reset the counter while closed, and they close a half-open breaker, because the server
-  answered;
+  answered. That includes a half-open probe answered with a redirect (classified ``client_error``
+  until the scheduler follows it): the breaker closes before the hop's target is requested, and
+  the hop is then admitted and recorded like any other request;
 * ``ok`` resets the consecutive-failure counter;
 * ``blocked`` and ``challenge`` trip the breaker at once. The retry policy already stops the domain
   for these; the breaker records the same decision so no other code path can send another request

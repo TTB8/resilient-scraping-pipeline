@@ -7,7 +7,16 @@ bug hurt most here, and both are prevented in this module rather than in storage
   same-site URLs, drops what is already known or repeated in the batch, and enforces the depth and
   page limits. Its output is sorted by URL, so the result (including *which* links survive the
   page cap) depends only on the set of inputs, never on the order a parser happened to emit them.
-  A resumed run therefore plans exactly what an uninterrupted one would have.
+  For one call, then, a resumed run plans exactly what an uninterrupted one would have. Across a
+  live crawl the order of calls is the order pages *land*, and with more than one request in flight
+  per domain that order is timing. Under ``--max-pages`` or ``--max-depth``, scope is therefore
+  first-come (which links fill the page cap depends on which page answered first), and an entry's
+  depth is its **first-discovery** depth, never lowered when a shallower page links it later (known
+  URLs are not re-planned), so a cap can cut a branch that a different response order would have
+  kept. Without caps the set of planned URLs is the same in every order (only the recorded depth
+  can differ). Offline expansion
+  (``expand_from_cache``) is order-independent, but it starts from the frontier the live order
+  built.
 * **Resurrected or lost URLs.** :func:`apply_decision` moves an entry through an explicit transition
   table. ``DONE`` and the ``FAILED_*`` / ``SKIPPED_*`` / ``STOPPED`` states are final: an attempt to
   leave one raises :class:`IllegalTransitionError` instead of silently re-fetching a page or
