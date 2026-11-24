@@ -6,6 +6,7 @@ from scraping_pipeline.core.circuit import (
     BreakerState,
     allow,
     describe,
+    generation,
     is_tripped,
     new_breaker,
     record,
@@ -204,3 +205,49 @@ def test_describe_is_human() -> None:
 def test_config_validation(kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError, match="must be"):
         BreakerConfig(**kwargs)  # type: ignore[arg-type]
+
+
+# --- stale results (R1-10) ------------------------------------------------------------------
+
+
+def test_stale_ok_does_not_close_a_half_open_breaker() -> None:
+    cfg = BreakerConfig(failure_threshold=1, cooldown_s=5.0, max_open_cycles=3)
+    state, _ = allow(new_breaker(cfg), 0.0)  # A: sent at t=0, slow
+    sent_a = generation(state)
+    state, _ = allow(state, 0.1)  # B
+    state = record(state, ResponseClass.SERVER_ERROR, 1.0, sent_in=generation(state))  # B opens it
+    state, probe = allow(state, 6.0)
+    sent_probe = generation(state)
+    assert probe
+    assert state.phase is BreakerPhase.HALF_OPEN
+    stale = record(state, ResponseClass.OK, 7.0, sent_in=sent_a)  # A answers, sent before opening
+    assert stale is state  # still half-open: only the probe decides
+    closed = record(stale, ResponseClass.OK, 8.0, sent_in=sent_probe)
+    assert closed.phase is BreakerPhase.CLOSED
+
+
+def test_stale_failure_does_not_reopen_or_escalate() -> None:
+    cfg = BreakerConfig(failure_threshold=1, cooldown_s=5.0, max_open_cycles=3)
+    state = new_breaker(cfg)
+    sent_a = generation(state)
+    state = record(state, ResponseClass.TIMEOUT, 1.0, sent_in=sent_a)
+    state, _ = allow(state, 6.0)
+    assert record(state, ResponseClass.TIMEOUT, 7.0, sent_in=sent_a) is state  # half-open
+    state = record(state, ResponseClass.OK, 8.0, sent_in=generation(state))  # probe closes it
+    assert record(state, ResponseClass.TIMEOUT, 9.0, sent_in=sent_a) is state  # closed: neutral
+    assert state.cooldown_s == 5.0
+
+
+def test_stale_refusal_still_trips() -> None:
+    cfg = BreakerConfig(failure_threshold=1, cooldown_s=5.0)
+    state = record(new_breaker(cfg), ResponseClass.TIMEOUT, 1.0, sent_in=0)
+    state, _ = allow(state, 6.0)
+    assert record(state, ResponseClass.BLOCKED, 7.0, sent_in=0).phase is BreakerPhase.TRIPPED
+
+
+def test_generation_counts_openings() -> None:
+    state = opened()
+    assert generation(state) == 1
+    state, _ = allow(state, 10.0)
+    state = record(state, ResponseClass.TIMEOUT, 10.0, sent_in=generation(state))
+    assert generation(state) == 2

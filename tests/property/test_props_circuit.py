@@ -3,7 +3,14 @@
 from hypothesis import given
 from hypothesis import strategies as st
 
-from scraping_pipeline.core.circuit import BreakerConfig, BreakerPhase, allow, new_breaker, record
+from scraping_pipeline.core.circuit import (
+    BreakerConfig,
+    BreakerPhase,
+    allow,
+    generation,
+    new_breaker,
+    record,
+)
 from scraping_pipeline.core.types import ResponseClass
 
 configs = st.builds(
@@ -49,3 +56,28 @@ def test_half_open_allows_at_most_one_probe(
             assert not was_tripped or state.phase is BreakerPhase.TRIPPED  # tripped is final
         assert state.open_cycles <= config.max_open_cycles + 1
         assert state.cooldown_s <= config.max_cooldown_s
+
+
+@given(config=configs, steps=ops, stale=st.lists(st.sampled_from(list(ResponseClass)), max_size=20))
+def test_results_sent_before_an_opening_never_close_it(
+    config: BreakerConfig,
+    steps: list[tuple[float, ResponseClass | None]],
+    stale: list[ResponseClass],
+) -> None:
+    """A request granted in generation g and answered after a later opening is never the probe."""
+    state = new_breaker(config)
+    now = 0.0
+    for advance, rc in steps:
+        now += advance
+        if rc is None:
+            state, _ = allow(state, now)
+        else:
+            state = record(state, rc, now, sent_in=generation(state))
+        if state.phase is BreakerPhase.HALF_OPEN and generation(state) > 0:
+            old = generation(state) - 1
+            for late in stale:
+                after = record(state, late, now, sent_in=old)
+                if late in (ResponseClass.BLOCKED, ResponseClass.CHALLENGE):
+                    assert after.phase is BreakerPhase.TRIPPED
+                else:
+                    assert after is state
