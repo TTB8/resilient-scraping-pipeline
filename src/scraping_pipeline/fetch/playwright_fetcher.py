@@ -217,7 +217,7 @@ _WIRE_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encod
 _MIN_TIMEOUT_MS = 1.0  # Playwright reads a timeout of 0 as "no timeout"
 
 
-@dataclass(slots=True)
+@dataclass  # no slots: Playwright caches its wrapper on the handler's object with setattr
 class _PageGuard:
     """Per-fetch state of the route handler."""
 

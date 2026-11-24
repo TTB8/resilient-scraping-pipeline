@@ -169,6 +169,11 @@ class FakePage:
     closed: bool = False
 
     async def route(self, pattern: str, handler: Handler) -> None:
+        # Real Playwright caches its wrapper on a bound method's object with setattr, so a handler
+        # whose object refuses new attributes (a slots class) fails on the first request.
+        owner = getattr(handler, "__self__", None)
+        if owner is not None:
+            setattr(owner, "_pw_impl_instance_handle", handler)  # noqa: B010
         self.handler = handler
 
     async def _send(self, url: str, kind: str, navigation: bool) -> FakeRoute:
