@@ -282,3 +282,83 @@ def test_stdlib_matches_agents_by_substring() -> None:
     text = "User-agent: examplebot\nDisallow: /"
     assert _stdlib(text, "/", ua="examplebot-news/1.0") is False
     assert allowed(text, "/", ua="examplebot-news/1.0") is True
+
+
+# --- R1-09: byte order mark and line endings -------------------------------------------------
+
+
+def test_leading_bom_does_not_lose_the_first_group() -> None:
+    text = "﻿User-agent: *\nDisallow: /\n"
+    assert not policy(text).can_fetch(UA, SITE + "/x")  # used to fail open
+    assert not RobotsPolicy.parse(text).can_fetch(UA, SITE + "/x")
+
+
+def test_bom_on_a_named_group_with_crlf() -> None:
+    text = "﻿User-agent: resilient-scraping-pipeline\r\nDisallow: /private\r\n"
+    assert not allowed(text, "/private/x")
+    assert allowed(text, "/public")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_line_endings(newline: str) -> None:
+    text = newline.join(["User-agent: *", "Disallow: /a", "Allow: /a/b", "Crawl-delay: 2", ""])
+    assert not allowed(text, "/a/x")
+    assert allowed(text, "/a/b")
+    assert policy(text).crawl_delay(UA) == 2.0
+
+
+# --- R1-12: percent-encoding equivalence and version-suffixed groups -------------------------
+
+
+@pytest.mark.parametrize(
+    ("rule", "path"),
+    [
+        ("/%7Ejoe", "/~joe/index.html"),  # encoded unreserved in the rule
+        ("/~joe", "/%7Ejoe/index.html"),  # ... or in the path
+        ("/~joe", "/%7ejoe/index.html"),
+        ("/caf%c3%a9", "/café"),  # lower-case hex vs raw UTF-8
+        ("/café", "/caf%c3%a9"),
+        ("/caf%C3%A9", "/caf%c3%a9"),
+        ("/a%20b", "/a b"),
+        ("/%41BC", "/ABC"),
+    ],
+)
+def test_percent_encoding_equivalence(rule: str, path: str) -> None:
+    assert not allowed(f"User-agent: *\nDisallow: {rule}\n", path)
+
+
+def test_escaped_reserved_characters_stay_distinct() -> None:
+    text = "User-agent: *\nDisallow: /a%2Fb\n"
+    assert not allowed(text, "/a%2fb")
+    assert allowed(text, "/a/b")
+
+
+def test_escaped_star_is_literal_not_a_wildcard() -> None:
+    text = "User-agent: *\nDisallow: /a%2Ab\n"
+    assert not allowed(text, "/a%2Ab")
+    assert allowed(text, "/axxb")
+
+
+def test_precedence_uses_normalized_lengths() -> None:
+    # "/%7Ejoe/" normalizes to "/~joe/" (6 chars), so the longer allow still wins.
+    text = "User-agent: *\nDisallow: /%7Ejoe/\nAllow: /~joe/pub\n"
+    assert allowed(text, "/~joe/pub/x")
+    assert not allowed(text, "/~joe/priv")
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        "resilient-scraping-pipeline/0.1",
+        "Resilient-Scraping-Pipeline/9.9 (+https://example.test)",
+        "RESILIENT-SCRAPING-PIPELINE",
+    ],
+)
+def test_version_suffixed_group_applies_to_us(group: str) -> None:
+    text = f"User-agent: *\nAllow: /\n\nUser-agent: {group}\nDisallow: /\n"
+    assert not allowed(text, "/x")  # used to fall back to the * group
+    assert allowed(text, "/x", ua="otherbot/1.0")
+
+
+def test_group_line_without_token_is_ignored() -> None:
+    assert allowed("User-agent: /1.0\nDisallow: /\n", "/x")

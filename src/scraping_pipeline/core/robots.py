@@ -25,23 +25,31 @@ Status handling (section 2.3.1), with the two places where we are stricter than 
   redirects itself (section 2.3.1.2); a raw 3xx here means it did not, and not knowing the rules is
   not permission.
 
-Other choices: only the first 500 KiB of the body are parsed (the RFC's minimum, which also bounds
-the work); rules are compared against the URL's path plus query; non-ASCII in patterns and paths is
-percent-encoded before comparison (section 2.2.2), while existing ``%XX`` escapes are compared as
-written; ``/robots.txt`` itself is always allowed. ``Crawl-delay`` is not in RFC 9309 but is widely
-used; we honour it as a minimum gap between requests (the largest value if several groups apply).
+Other choices:
+
+* only the first 500 KiB of the body are parsed (the RFC's minimum, which also bounds the work); a
+  leading UTF-8 byte order mark is dropped, and ``\n``, ``\r\n`` and ``\r`` all end a line;
+* rules are compared against the URL's path plus query, and both sides go through the same
+  percent-encoding normalization (:func:`~.urls.normalize_percent_encoding`, section 2.2.2):
+  ``%7E`` equals ``~``, ``%c3%a9`` equals ``%C3%A9`` equals ``é``, while an escaped reserved
+  character such as ``%2F`` stays distinct from ``/``, and ``*`` / ``$`` stay wildcards;
+* a group line is reduced to its product token the same way our own User-Agent is, so a group
+  written ``User-agent: MyBot/1.0`` applies to ``MyBot``;
+* ``/robots.txt`` itself is always allowed;
+* ``Crawl-delay`` is not in RFC 9309 but is widely used. We honour it as a minimum gap between
+  requests (the largest value if several groups apply).
 """
 
 import math
 import re
-import string
 from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
+
+from scraping_pipeline.core.urls import normalize_percent_encoding
 
 MAX_ROBOTS_CHARS = 500 * 1024
-_SAFE = string.ascii_letters + string.digits + string.punctuation
 
 
 class RobotsMode(StrEnum):
@@ -54,7 +62,7 @@ class RobotsMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class RobotsRule:
-    """One ``allow`` / ``disallow`` line. ``pattern`` is percent-encoded, wildcards intact."""
+    """One ``allow`` / ``disallow`` line. ``pattern`` is percent-normalized, wildcards intact."""
 
     allow: bool
     pattern: str
@@ -103,7 +111,12 @@ class RobotsPolicy:
 
     @classmethod
     def parse(cls, text: str, reason: str = "parsed") -> "RobotsPolicy":
-        """Parse robots.txt text into groups (RFC 9309 section 2.1)."""
+        """Parse robots.txt text into groups (RFC 9309 section 2.1).
+
+        A leading UTF-8 byte order mark is dropped: left in, it glues itself to the first key
+        (``\ufeffuser-agent``), the first group is lost and its rules silently stop applying.
+        """
+        text = text.removeprefix("\ufeff")
         return cls(RobotsMode.RULES, _parse_groups(text[:MAX_ROBOTS_CHARS]), reason)
 
     def can_fetch(self, user_agent: str, url: str) -> bool:
@@ -116,7 +129,7 @@ class RobotsPolicy:
         path = parts.path or "/"
         if path == "/robots.txt":
             return True
-        target = _encode(path + (f"?{parts.query}" if parts.query else ""))
+        target = normalize_percent_encoding(path + (f"?{parts.query}" if parts.query else ""))
         best: RobotsRule | None = None
         for group in self._groups_for(user_agent):
             for rule in group.rules:
@@ -165,8 +178,9 @@ def _parse_groups(text: str) -> tuple[RobotsGroup, ...]:
             if in_rules:  # a user-agent after rules starts a new group
                 flush()
                 agents, rules, delay, in_rules = [], [], None, False
-            if value:
-                agents.append(value.casefold())
+            token = product_token(value)  # "MyBot/1.0" in a group line names the token "mybot"
+            if token:
+                agents.append(token)
         elif key in ("allow", "disallow"):
             in_rules = True
             if value:  # an empty value is "no rule"
@@ -179,7 +193,7 @@ def _parse_groups(text: str) -> tuple[RobotsGroup, ...]:
 
 
 def _rule(allow: bool, value: str) -> RobotsRule:
-    pattern = _encode(value)
+    pattern = normalize_percent_encoding(value)
     anchored = pattern.endswith("$")
     body = pattern[:-1] if anchored else pattern
     regex = ".*".join(re.escape(piece) for piece in body.split("*"))
@@ -194,7 +208,3 @@ def _parse_delay(value: str, current: float | None) -> float | None:
     if not math.isfinite(seconds) or seconds < 0:
         return current
     return seconds
-
-
-def _encode(text: str) -> str:
-    return quote(text, safe=_SAFE)
