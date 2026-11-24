@@ -1,7 +1,8 @@
 """Validated runtime settings, read from ``PIPELINE_*`` environment variables or a ``.env`` file.
 
 Politeness lives here as *defaults that are safe without reading the docs*: one request per second
-per domain, two in flight at most, an honest User-Agent with a contact URL. They can be tuned, but
+per domain, two in flight at most, an honest User-Agent (our own name/version, a contact point,
+no borrowed browser or crawler identity). They can be tuned, but
 not past hard ceilings, and robots.txt cannot be switched off at all: a pipeline that can be
 configured into being rude eventually will be. See ``docs/decisions/0006-politeness-defaults.md``.
 
@@ -28,6 +29,18 @@ MAX_CONCURRENCY_PER_DOMAIN = 8
 
 # A contact point: an http(s) URL or an e-mail address, anywhere in the User-Agent.
 _CONTACT = re.compile(r"(https?://\S+|[\w.+-]+@[\w-]+\.[\w.-]+)")
+
+# "Honest" means it names this crawler and how to reach its operator, so it must lead with its own
+# product token (``name/version``) ...
+_PRODUCT_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(\s|$)")
+# ... and must not borrow the identity of a browser or of another crawler. A site that allow-lists
+# a search engine, or serves browsers differently, would otherwise treat us as something we're not.
+_IMPERSONATION = re.compile(
+    r"mozilla/|applewebkit|chrome/|chromium/|safari/|firefox/|gecko/|edg/|opr/|"
+    r"googlebot|bingbot|yandex|baiduspider|duckduckbot|slurp|applebot|facebookexternalhit|"
+    r"python-requests|python-httpx|curl/|wget/|go-http-client|okhttp|headlesschrome",
+    re.IGNORECASE,
+)
 
 
 class Settings(BaseSettings):
@@ -100,6 +113,12 @@ class Settings(BaseSettings):
     @classmethod
     def _honest_user_agent(cls, value: str) -> str:
         value = value.strip()
+        if not _PRODUCT_TOKEN.match(value):
+            raise ValueError("user_agent must start with this crawler's own name/version token")
+        if match := _IMPERSONATION.search(value):
+            raise ValueError(
+                f"user_agent must not impersonate a browser or another crawler ({match.group(0)!r})"
+            )
         if not _CONTACT.search(value):
             raise ValueError("user_agent must include a contact URL or e-mail address")
         return value

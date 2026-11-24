@@ -39,7 +39,12 @@ def test_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"user_agent": "python-requests/2.0"},  # no contact point
+        {"user_agent": "my-bot/1.0"},  # no contact point
+        {"user_agent": "(+https://x.test) my-bot/1.0"},  # does not lead with its own token
+        {"user_agent": "Mozilla/5.0 (compatible; my-bot/1.0; +https://x.test)"},  # browser token
+        {"user_agent": "my-bot/1.0 (compatible; Googlebot/2.1; +https://x.test)"},  # other crawler
+        {"user_agent": "my-bot/1.0 Chrome/120.0 (+https://x.test)"},
+        {"user_agent": "python-requests/2.32 (+https://x.test)"},  # library default identity
         {"requests_per_second": MAX_REQUESTS_PER_SECOND + 1},
         {"requests_per_second": 0},
         {"max_concurrency_per_domain": 0},
