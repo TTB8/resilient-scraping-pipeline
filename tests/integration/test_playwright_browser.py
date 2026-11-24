@@ -68,3 +68,29 @@ async def test_connection_refused_is_mapped() -> None:
         result = await fetcher.fetch(f"http://127.0.0.1:{port}/")
     assert result.error is TransportError.CONNECT
     assert result.status is None
+
+
+async def test_redirect_is_reported_not_followed(fixture_server: FixtureServer) -> None:
+    fixture_server.redirect("/old", "/_js/quotes.html", status=301)
+    async with PlaywrightFetcher(make_settings(user_agent=UA, request_timeout_s=5.0)) as fetcher:
+        result = await fetcher.fetch(fixture_server.url("/old"))
+    assert result.status == 301
+    assert result.headers["location"] == "/_js/quotes.html"
+    assert result.error is None
+    assert fixture_server.hits("/_js/quotes.html") == 0  # the scheduler decides about the hop
+
+
+async def test_only_the_document_and_same_origin_scripts_are_requested(
+    fixture_server: FixtureServer,
+) -> None:
+    page = (
+        b"<html><head><link rel=stylesheet href=/style.css>"
+        b"<script src=/app.js></script></head><body><img src=/pic.png>"
+        b"<img src=http://localhost:9/off.png><div class=quote>q</div></body></html>"
+    )
+    fixture_server.route("/page", Phase(200, page, {"Content-Type": "text/html"}))
+    fixture_server.route("/app.js", Phase(200, b"void 0;", {"Content-Type": "text/javascript"}))
+    async with PlaywrightFetcher(make_settings(user_agent=UA), ".quote") as fetcher:
+        result = await fetcher.fetch(fixture_server.url("/page"))
+    assert result.status == 200
+    assert set(fixture_server.hit_counts()) == {"/page", "/app.js"}  # no css, no images

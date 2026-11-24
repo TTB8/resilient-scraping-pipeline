@@ -37,6 +37,7 @@ from urllib.parse import urljoin
 from pydantic import BaseModel
 
 from scraping_pipeline.config import Settings
+from scraping_pipeline.core.classify import DEFAULT_MARKERS
 from scraping_pipeline.core.contracts import Author, Book, Quote, books_v1, quotes_v1
 from scraping_pipeline.core.parsers import books as books_parser
 from scraping_pipeline.core.parsers import quotes as quotes_parser
@@ -104,7 +105,8 @@ class SiteSpec:
 
     def make_fetcher(self, settings: Settings) -> Fetcher:
         if self.fetcher == "playwright":
-            return PlaywrightFetcher(settings, self.wait_for_selector)
+            # The same block/challenge markers the scheduler classifies with (its default).
+            return PlaywrightFetcher(settings, self.wait_for_selector, markers=DEFAULT_MARKERS)
         return HttpxFetcher(settings)
 
     def table_for(self, record: BaseModel) -> TableSpec:

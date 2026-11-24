@@ -24,7 +24,7 @@ from scraping_pipeline.storage.state import (
     Stage,
     StateStore,
 )
-from stage_support import fast_fetch, saved_site_fetcher, stage_settings
+from stage_support import fast_fetch, saved_site_fetcher, settled_urls, stage_settings
 
 HOME = "https://quotes.toscrape.com/"
 PAGE_2 = "https://quotes.toscrape.com/page/2/"
@@ -55,7 +55,9 @@ def test_fetch_expands_links_as_pages_land_until_nothing_is_left(tmp_path: Path)
     assert result.statuses[FrontierStatus.PENDING] == 0  # the feeder did not end early
     assert result.statuses[FrontierStatus.DONE] == 4  # /, /page/2/ and the two saved authors
     assert result.links_added == 17
-    assert result.attempts == 18 == len(log.urls())
+    assert result.attempts == 18
+    # The site saw every attempt, the two redirect hops (/author/X -> /author/X/) and robots.txt.
+    assert result.requests == sum(len(f.calls) for f in log.fetchers) == 18 + 2 + 1
     assert max(Counter(log.urls()).values()) == 1  # nothing fetched twice
     assert result.by_class == {ResponseClass.NOT_FOUND: 14, ResponseClass.OK: 4}
     assert not result.interrupted
@@ -123,10 +125,11 @@ def test_a_crash_between_cache_and_state_is_recovered_without_a_refetch(
         assert store.runs(Site.QUOTES)[-1].status is RunStatus.FAILED
 
     before = len(log.urls())
+    settled = settled_urls(settings, Site.QUOTES)
     result = fast_fetch(settings, Site.QUOTES, factory)
     assert result.recovered == 1
     assert PAGE_2 not in log.urls()[before:]  # recovered, not refetched
-    assert max(Counter(log.urls()).values()) == 1
+    assert not settled & set(log.urls()[before:])  # nothing settled is asked for again
     assert result.statuses[FrontierStatus.PENDING] == 0
     # Its links (page 3, its authors) were planned offline at the start of the second run.
     assert ("https://quotes.toscrape.com/page/3/") in log.urls()[before:]
@@ -173,7 +176,7 @@ def test_ctrl_c_keeps_every_recorded_result_and_the_rerun_resumes(
     runner, timing, vt = _cancelling_runner(3, monkeypatch)
     # Pages answer after a (virtual) moment, so a fetch yields like real I/O and the cancellation
     # reaches the crawl between pages, as Ctrl-C does with a real fetcher.
-    factory, log = saved_site_fetcher("quotes", delay_s=0.01, sleep=vt.sleep)
+    factory, _ = saved_site_fetcher("quotes", delay_s=0.01, sleep=vt.sleep)
     first = run_fetch(settings, Site.QUOTES, fetcher_factory=factory, timing=timing, runner=runner)
     monkeypatch.undo()
 
@@ -185,12 +188,16 @@ def test_ctrl_c_keeps_every_recorded_result_and_the_rerun_resumes(
     assert run is not None
     assert run.status is RunStatus.INTERRUPTED
 
+    settled = settled_urls(settings, Site.QUOTES)
+    assert len(settled) >= 3
     resumed, resumed_log = saved_site_fetcher("quotes")  # a new process: new fetcher, new clock
     second = fast_fetch(settings, Site.QUOTES, resumed)
     assert not second.interrupted
     assert second.statuses[FrontierStatus.PENDING] == 0
-    both = log.urls() + resumed_log.urls()
-    assert max(Counter(both).values()) == 1  # the kill landed between pages: nothing refetched
+    # Every recorded result survived the kill: none of those pages is asked for again. (An
+    # attempt abandoned mid-flight stays pending and is fetched again, as it should be.)
+    assert not settled & set(resumed_log.urls())
+    assert max(Counter(resumed_log.urls()).values()) == 1
     reference = _discovered(tmp_path / "reference")
     fast_fetch(reference, Site.QUOTES, saved_site_fetcher("quotes")[0])
     assert _snapshot(settings) == _snapshot(reference)

@@ -2,8 +2,8 @@
 
 ``saved_site_fetcher`` turns ``tests/fixtures/sites/<site>/`` into a :class:`FakeFetcher` script at
 the sites' real URLs (``https://books.toscrape.com/...``), so a whole crawl runs with no socket at
-all. Like the real quotes site, a saved directory requested without its trailing slash answers
-with the slashed page (a followed redirect: ``final_url`` differs). Unknown URLs are 404.
+all. Like the real quotes site, a saved directory requested without its trailing slash answers 301
+to the slashed path; the scheduler follows the hop and reports it as ``final_url``. Unknown URLs are 404.
 
 ``fast_fetch`` runs ``run_fetch`` under :class:`fetch_support.VirtualTime`, so politeness waits and
 backoffs cost no real time.
@@ -20,9 +20,12 @@ from typing import Any
 from fetch_support import VirtualTime, no_env_settings
 from fixture_server import SITES
 from scraping_pipeline.config import Settings
+from scraping_pipeline.core.frontier import FINAL_STATES
 from scraping_pipeline.core.types import Site
 from scraping_pipeline.fetch.fake import FakeFetcher, Respond, Step, ok, slow
 from scraping_pipeline.stages.fetch import FetchStageResult, FetchTiming, run_fetch
+from scraping_pipeline.storage.cache import PageCache
+from scraping_pipeline.storage.state import StateStore
 
 BASE = {"books": "https://books.toscrape.com", "quotes": "https://quotes.toscrape.com"}
 FAST = {
@@ -64,9 +67,8 @@ def saved_pages(fixtures: str) -> dict[str, Step]:
             scripts[f"{base}/{rel}"] = ok(body)  # books links its pages as .../index.html
             if folder:
                 bare = slashed.rstrip("/")
-                scripts[bare] = Respond(
-                    200, body, {"content-type": "text/html; charset=utf-8"}, final_url=slashed
-                )
+                # A real redirect, as the site sends: the scheduler follows it itself.
+                scripts[bare] = Respond(301, b"", {"location": slashed})
         else:
             scripts[f"{base}/{rel}"] = ok(body)
     return scripts
@@ -134,3 +136,15 @@ def fast_fetch(
         timing=timing,
         runner=runner,
     )
+
+
+def settled_urls(settings: Settings, site: Site) -> set[str]:
+    """URLs a resumed run must never request again: every final frontier entry, plus where each
+    cached page's redirects ended. (An attempt abandoned mid-flight, between a redirect and its
+    hop say, stays pending and is rightly fetched again.)"""
+
+    with StateStore.open(settings.state_db) as store:
+        final = [e.url for e in store.entries(site) if e.status in FINAL_STATES]
+    cache = PageCache(settings.cache_dir)
+    hops = {entry.final_url for url in final if (entry := cache.get_entry(url)) is not None}
+    return set(final) | hops

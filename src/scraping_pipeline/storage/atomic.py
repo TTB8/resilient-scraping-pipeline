@@ -113,7 +113,13 @@ def _create_temp(target: Path) -> tuple[Path, int]:
 
 
 def _fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    """fsync a file another writer produced, through a *writable* descriptor.
+
+    POSIX accepts ``fsync`` on a read-only descriptor, but Windows implements it with
+    ``FlushFileBuffers``, which needs write access and fails with ``EBADF`` on ``O_RDONLY``. Opening
+    ``O_WRONLY`` (no ``O_TRUNC``, no ``O_APPEND``) changes nothing in the file and works on both.
+    """
+    fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
     try:
         os.fsync(fd)
     finally:

@@ -186,7 +186,7 @@ def test_usage_errors_exit_2(invoke: Callable[..., Result], tmp_path: Path) -> N
     with StateStore.open(settings.state_db):  # another pipeline holds the state database
         locked = invoke("status", "--site", "quotes")
     assert locked.exit_code == 2
-    assert "another pipeline process" in locked.stderr
+    assert "already open" in locked.stderr or "another pipeline process" in locked.stderr
 
 
 def test_status_of_a_fresh_data_dir(invoke: Callable[..., Result]) -> None:

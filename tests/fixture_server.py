@@ -63,6 +63,7 @@ class Phase:
     headers: Mapping[str, str] = field(default_factory=dict)
     delay_s: float = 0.0
     times: int | None = None
+    drip_s: float = 0.0  # > 0: send the body one byte at a time, this many seconds apart
 
     @classmethod
     def serve(cls, times: int | None = None, *, delay_s: float = 0.0) -> Self:
@@ -71,6 +72,11 @@ class Phase:
     @classmethod
     def slow(cls, delay_s: float, times: int | None = None) -> Self:
         return cls(times=times, delay_s=delay_s)
+
+    @classmethod
+    def drip(cls, every_s: float, size: int = 40, times: int | None = None) -> Self:
+        """200 whose body trickles in a byte at a time: each read is quick, the whole is not."""
+        return cls(200, b"x" * size, {"Content-Type": "text/plain"}, times=times, drip_s=every_s)
 
     @classmethod
     def error(cls, status: int = 500, times: int | None = None) -> Self:
@@ -251,7 +257,13 @@ class FixtureServer:
                 request.send_header(name, value)
             request.send_header("Content-Length", str(len(phase.body)))
             request.end_headers()
-            request.wfile.write(phase.body)
+            if phase.drip_s > 0:
+                for index in range(len(phase.body)):
+                    request.wfile.write(phase.body[index : index + 1])
+                    request.wfile.flush()
+                    time.sleep(phase.drip_s)
+            else:
+                request.wfile.write(phase.body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the client gave up (a timeout test); nothing to answer
 

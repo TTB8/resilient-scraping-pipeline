@@ -179,7 +179,9 @@ def fetch(
 def _fetch_line(result: FetchStageResult) -> str:
     statuses = ", ".join(f"{k.value} {v}" for k, v in result.statuses.items() if v)
     return (
-        f"fetch {result.run_id}: {result.attempts} attempts, {result.recovered} recovered from "
+        f"fetch {result.run_id}: {result.attempts} attempts"
+        + (f" ({result.requests} requests)" if result.requests is not None else "")
+        + f", {result.recovered} recovered from "
         f"cache, {result.links_added} links added; frontier: {statuses or 'empty'}"
         + (" (interrupted)" if result.interrupted else "")
     )

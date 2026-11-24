@@ -3,18 +3,40 @@
 The scheduler is the glue between I/O and the pure rules in ``core/``. It holds per-domain state and
 calls the rules; it never re-decides anything they already decide:
 
-* ``core.robots``: robots.txt is fetched **once per domain per run**, through the same fetcher and
-  the same politeness budget as every other request, *before* any other request to that domain.
-  Once, because the rules must not change halfway through a run (a URL allowed at minute one and
-  refused at minute ten makes the output depend on timing), and because re-reading robots.txt for
-  every URL would double the load we put on the site. A resumed run fetches it again.
+* ``core.robots``: robots.txt is read **once per domain per run**, through the same fetcher and the
+  same politeness budget as every other request, *before* any other request to that domain. Once,
+  because the rules must not change halfway through a run (a URL allowed at minute one and refused
+  at minute ten makes the output depend on timing), and because re-reading robots.txt for every URL
+  would double the load we put on the site. "Once" means one *answer*: a 5xx, 429 or network
+  failure is not an answer, so that fetch is retried with the same backoff policy as pages
+  (``Retry-After`` honoured). If robots.txt still cannot be read, the domain is **stopped**, not
+  marked ``skipped_robots``: "we could not read the rules" is not "the rules forbid it", and a
+  stopped entry is reset and retried by the next run. A 4xx means "no rules" (allow all), and a
+  parsed ``Disallow`` is a real refusal (``skipped_robots``, final).
 * ``core.ratelimit``: one token bucket per domain, capped by robots ``Crawl-delay``, slowed down
-  after every ``rate_limited`` answer and gently sped up after successes (AIMD).
+  after every ``rate_limited`` answer and gently sped up after successes (AIMD). Every HTTP request
+  takes a token: page attempts, each redirect hop, each robots.txt attempt.
 * ``core.circuit``: one breaker per domain. While it is open, nothing is sent to the domain; when it
-  trips, the domain is stopped.
+  trips, the domain is stopped. Each request carries the breaker generation it was granted in, so
+  a slow request sent before an opening can never pass for the half-open probe.
 * ``core.classify`` / ``core.retry`` / ``core.frontier``: every finished attempt is classified
   (with ``now_epoch``, so HTTP-date ``Retry-After`` values count), decided, and recorded with
   :func:`~scraping_pipeline.core.frontier.apply_decision`.
+
+Redirects: the scheduler follows them, not the fetcher
+-----------------------------------------------------
+
+Fetchers never follow redirects. A redirect hop is a request like any other, so it must pass the
+same gates: the scheduler follows a ``301/302/303/307/308`` with a ``Location`` only when the target
+is on the **same origin** as the entry (scheme, host and port), robots.txt allows it, and the bucket
+and breaker let it through; at most :data:`MAX_REDIRECT_HOPS` hops per attempt. Anything else is a
+``client_error`` (permanent, never retried) with the reason in the frontier: "off-site redirect to
+<host> refused" (another host, scheme or port, which also covers internal and metadata addresses
+such as ``169.254.169.254``), "redirect loop" (too many hops), or a robots.txt refusal of the target.
+The body is stored under the entry's URL, and ``FetchResult.final_url`` records where it came from.
+A fetcher that reports a ``final_url`` on another origin anyway is refused the same way (defence in
+depth). This is what makes "the crawl never leaves a site" true, and what makes the rate bound hold
+for requests rather than only for tokens.
 
 Why a blocked domain is stopped, not retried
 --------------------------------------------
@@ -66,10 +88,10 @@ import random
 import time
 from collections import Counter
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.circuit import (
@@ -78,6 +100,7 @@ from scraping_pipeline.core.circuit import (
     BreakerState,
     allow,
     describe,
+    generation,
     is_tripped,
     new_breaker,
     record,
@@ -100,12 +123,18 @@ from scraping_pipeline.core.ratelimit import (
 from scraping_pipeline.core.retry import BackoffPolicy, RetryAction, decide
 from scraping_pipeline.core.robots import RobotsPolicy
 from scraping_pipeline.core.types import FrontierStatus, ResponseClass
+from scraping_pipeline.core.urls import InvalidUrlError, canonicalize
 from scraping_pipeline.core.urls import domain as domain_of
 from scraping_pipeline.fetch.protocol import Fetcher, FetchResult
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 Rand = Callable[[], float]
+
+#: Redirect hops followed per attempt (and per robots.txt fetch), the number RFC 9309 asks for.
+MAX_REDIRECT_HOPS = 5
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class FetchSink(Protocol):
@@ -116,7 +145,9 @@ class FetchSink(Protocol):
     """
 
     async def on_robots(self, domain: str, policy: RobotsPolicy, result: FetchResult) -> None:
-        """robots.txt for ``domain`` was fetched (once per run) and parsed into ``policy``."""
+        """robots.txt for ``domain`` was settled (once per run): parsed into ``policy``, or, when it
+        could not be read after retries, ``policy`` is disallow-all and the domain is stopped right
+        after (``on_domain_stopped`` follows). ``result`` is the last fetch."""
 
     async def on_result(
         self,
@@ -139,9 +170,14 @@ class FetchSink(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CrawlSummary:
-    """What a run did. ``final_statuses`` counts every entry the run settled, by final status."""
+    """What a run did. ``final_statuses`` counts every entry the run settled, by final status.
+
+    ``attempts`` counts page attempts (what the frontier records); ``requests`` counts every HTTP
+    request sent, robots.txt attempts and redirect hops included (what the site sees).
+    """
 
     attempts: int
+    requests: int
     by_class: Mapping[ResponseClass, int]
     final_statuses: Mapping[FrontierStatus, int]
     domains_stopped: Mapping[str, str]
@@ -174,6 +210,36 @@ def robots_url_for(url: str) -> str:
     """``scheme://host[:port]/robots.txt`` for the origin of ``url``."""
     parts = urlsplit(url)
     return f"{parts.scheme}://{parts.netloc}/robots.txt"
+
+
+def origin_of(url: str) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` of an http(s) URL, default port filled in; ``None`` otherwise."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return scheme, parts.hostname.lower(), port if port is not None else _DEFAULT_PORTS[scheme]
+
+
+def redirect_location(result: FetchResult) -> str | None:
+    """The raw ``Location`` of a followable redirect answer, else ``None``."""
+    if result.error is not None or result.status not in REDIRECT_STATUSES:
+        return None
+    location = result.headers.get("location", "").strip()
+    return location or None
+
+
+def _host_of(url: str) -> str:
+    return urlsplit(url).hostname or url
+
+
+def _refused(reason: str) -> Classification:
+    """A permanent verdict for a redirect the scheduler will not follow (never retried)."""
+    return Classification(ResponseClass.CLIENT_ERROR, None, reason)
 
 
 class PoliteScheduler:
@@ -219,6 +285,7 @@ class PoliteScheduler:
         self._domains: dict[str, _Domain] = {}
         self._seen: set[str] = set()
         self._attempts = 0
+        self._requests = 0
         self._by_class: Counter[ResponseClass] = Counter()
         self._final: Counter[FrontierStatus] = Counter()
         self._duplicates = 0
@@ -251,6 +318,7 @@ class PoliteScheduler:
             raise
         return CrawlSummary(
             attempts=self._attempts,
+            requests=self._requests,
             by_class=MappingProxyType(dict(self._by_class)),
             final_statuses=MappingProxyType(dict(self._final)),
             domains_stopped=MappingProxyType(
@@ -301,14 +369,11 @@ class PoliteScheduler:
             return
         while True:
             await self._wait_until_due(d, entry)
-            result: FetchResult | None = None
-            async with d.semaphore:
-                if await self._admit(d):
-                    result = await self._fetcher.fetch(entry.url)
-            if result is None:
+            outcome = await self._attempt(d, entry, policy)
+            if outcome is None:
                 await self._mark_stopped(d, entry)
                 return
-            entry = await self._record_attempt(d, entry, result)
+            entry = await self._record_attempt(d, entry, *outcome)
             if entry.status is not FrontierStatus.PENDING:
                 return
             if d.stopped is not None:
@@ -323,16 +388,75 @@ class PoliteScheduler:
                 return
             await self._nap(d, remaining)
 
-    async def _admit(self, d: _Domain) -> bool:
-        """Wait until the bucket and the breaker both let a request through. False: stopped.
+    async def _attempt(
+        self, d: _Domain, entry: FrontierEntry, policy: RobotsPolicy
+    ) -> tuple[FetchResult, Classification] | None:
+        """One attempt: the request plus any same-origin redirect hops. ``None``: domain stopped.
 
-        The token is taken before asking the breaker, so a half-open probe is never granted to a
-        task that then has to wait for the bucket. A token taken while the breaker says no is
-        wasted, which can only make the crawl slower, never faster.
+        Every hop is admitted (token + breaker), observed (breaker, bucket) and robots-checked like
+        a first request. The returned result carries the entry's URL as ``requested_url`` and the
+        last hop's URL as ``final_url``.
+        """
+        home = origin_of(entry.url)
+        url = entry.url
+        elapsed = 0.0
+        hops = 0
+        while True:
+            async with d.semaphore:
+                ticket = await self._admit(d)
+                if ticket is None:
+                    return None
+                result = await self._fetcher.fetch(url)
+            self._requests += 1
+            elapsed += result.elapsed_s
+            verdict = self._observe(d, result, ticket)
+            labelled = replace(result, requested_url=entry.url, final_url=url, elapsed_s=elapsed)
+            if origin_of(result.final_url) != home:  # the fetcher followed one by itself
+                return labelled, _refused(
+                    f"off-site redirect to {_host_of(result.final_url)} refused"
+                )
+            location = redirect_location(result)
+            if location is None:
+                return labelled, verdict
+            target, refusal = self._next_hop(url, location, home, hops, policy)
+            if refusal is not None:
+                return labelled, refusal
+            assert target is not None  # noqa: S101 - _next_hop returns exactly one of the two
+            hops += 1
+            url = target
+
+    def _next_hop(
+        self,
+        url: str,
+        location: str,
+        home: tuple[str, str, int] | None,
+        hops: int,
+        policy: RobotsPolicy,
+    ) -> tuple[str | None, Classification | None]:
+        """Where a redirect from ``url`` may go, or why it may not."""
+        try:
+            target = canonicalize(urljoin(url, location))
+        except InvalidUrlError:
+            return None, _refused(f"redirect to {location!r} refused: not an http(s) URL")
+        if origin_of(target) != home:
+            return None, _refused(f"off-site redirect to {_host_of(target)} refused")
+        if hops >= MAX_REDIRECT_HOPS:
+            return None, _refused(f"redirect loop: more than {MAX_REDIRECT_HOPS} hops, at {target}")
+        if not policy.can_fetch(self._settings.user_agent, target):
+            return None, _refused(f"redirect to {target} refused: robots.txt disallows it")
+        return target, None
+
+    async def _admit(self, d: _Domain) -> int | None:
+        """Wait until the bucket and the breaker both let a request through.
+
+        Returns the breaker generation the request is granted in, or ``None`` when the domain
+        stopped. The token is taken before asking the breaker, so a half-open probe is never
+        granted to a task that then has to wait for the bucket. A token taken while the breaker
+        says no is wasted, which can only make the crawl slower, never faster.
         """
         while True:
             if d.stopped is not None:
-                return False
+                return None
             now = self._clock()
             d.bucket, wait = acquire(d.bucket, now)
             if wait > 0:
@@ -340,34 +464,41 @@ class PoliteScheduler:
                 continue
             d.breaker, allowed = allow(d.breaker, now)
             if allowed:
-                return True
+                return generation(d.breaker)
             if is_tripped(d.breaker):  # defensive: _record_attempt claims the stop when it trips
                 if self._claim_stop(d, describe(d.breaker)):
                     await self._announce_stop(d)
-                return False
+                return None
             if d.breaker.phase is BreakerPhase.OPEN and d.breaker.open_until is not None:
                 await self._nap(d, d.breaker.open_until - now)
             else:  # half-open: the probe is out; its result will poke us
                 await self._nap(d, None)
 
-    async def _record_attempt(
-        self, d: _Domain, entry: FrontierEntry, result: FetchResult
-    ) -> FrontierEntry:
-        now_epoch = self._wall_clock()
+    def _observe(self, d: _Domain, result: FetchResult, ticket: int) -> Classification:
+        """Classify one HTTP request and feed it to the breaker and the bucket."""
         verdict = classify(
             result.status,
             result.headers,
             result.text(),
             result.error,
             markers=self._markers,
-            now_epoch=now_epoch,
+            now_epoch=self._wall_clock(),
         )
         response_class = verdict.response_class
-        d.breaker = record(d.breaker, response_class, self._clock())
+        now = self._clock()
+        d.breaker = record(d.breaker, response_class, now, sent_in=ticket)
         if response_class is ResponseClass.RATE_LIMITED:
-            d.bucket = slow_down(d.bucket)
+            d.bucket = slow_down(d.bucket, now=now)
         elif response_class is ResponseClass.OK:
             d.bucket = speed_up(d.bucket)
+        d.poke()
+        return verdict
+
+    async def _record_attempt(
+        self, d: _Domain, entry: FrontierEntry, result: FetchResult, verdict: Classification
+    ) -> FrontierEntry:
+        now_epoch = self._wall_clock()
+        response_class = verdict.response_class
         decision = (
             None
             if response_class is ResponseClass.OK
@@ -396,34 +527,97 @@ class PoliteScheduler:
     async def _ensure_robots(self, d: _Domain) -> RobotsPolicy:
         async with d.robots_lock:
             if d.policy is None:
-                async with d.semaphore:
-                    # A new domain's bucket is full, so robots.txt always gets the first token
-                    # (and it counts against the budget like every other request).
-                    d.bucket, _ = acquire(d.bucket, self._clock())
-                    result = await self._fetcher.fetch(d.robots_url)
-                # A transport error, even with a status (an oversize body), means we do not know
-                # the rules: RobotsPolicy treats "unreachable" as disallow-all.
-                status = result.status if result.error is None else None
-                policy = RobotsPolicy.from_response(status, result.text())
-                crawl_delay = policy.crawl_delay(self._settings.user_agent)
-                d.bucket = apply_crawl_delay(d.bucket, crawl_delay)
-                d.policy = policy
-                # A Crawl-delay beyond what we are willing to wait is the site asking for (almost)
-                # no traffic: honour it by stopping, like an over-long Retry-After, instead of
-                # crawling at one page an hour.
-                claimed = (
-                    crawl_delay is not None
-                    and crawl_delay > self._settings.max_crawl_delay_s
-                    and self._claim_stop(
-                        d,
-                        f"robots.txt Crawl-delay {crawl_delay:g}s exceeds the "
-                        f"{self._settings.max_crawl_delay_s:g}s limit",
-                    )
-                )
-                await self._sink.on_robots(d.name, policy, result)
-                if claimed:
-                    await self._announce_stop(d)
+                await self._load_robots(d)
+            assert d.policy is not None  # noqa: S101 - _load_robots always sets it
             return d.policy
+
+    async def _load_robots(self, d: _Domain) -> None:
+        """Read robots.txt until it answers, or stop the domain (see the module docstring)."""
+        attempt = 0
+        while True:
+            attempt += 1
+            result, refusal = await self._fetch_robots_once(d)
+            if refusal is not None:  # a redirect we will not follow: the same on every try
+                await self._robots_unreachable(d, result, refusal)
+                return
+            if _robots_answered(result):
+                await self._robots_parsed(d, result)
+                return
+            verdict = classify(
+                result.status,
+                result.headers,
+                None,  # robots.txt is not a page: no block-marker scan
+                result.error,
+                markers=self._markers,
+                now_epoch=self._wall_clock(),
+            )
+            if verdict.response_class is ResponseClass.RATE_LIMITED:
+                d.bucket = slow_down(d.bucket, now=self._clock())
+            decision = decide(self._policy, verdict, attempt, self._rand())
+            if decision.action is not RetryAction.RETRY or decision.delay_s is None:
+                await self._robots_unreachable(d, result, f"{verdict.reason}; {decision.reason}")
+                return
+            await self._sleep(decision.delay_s)
+
+    async def _fetch_robots_once(self, d: _Domain) -> tuple[FetchResult, str | None]:
+        """One robots.txt fetch, following same-host redirects (at most five, each a request)."""
+        url = d.robots_url
+        home_host = _host_of(d.robots_url).lower()
+        hops = 0
+        while True:
+            await self._take_token(d)
+            result = await self._fetcher.fetch(url)
+            self._requests += 1
+            labelled = replace(result, requested_url=d.robots_url, final_url=url)
+            location = redirect_location(result)
+            if location is None:
+                return labelled, None
+            try:
+                target = canonicalize(urljoin(url, location))
+            except InvalidUrlError:
+                return labelled, f"redirect to {location!r} refused: not an http(s) URL"
+            if _host_of(target).lower() != home_host:
+                return labelled, f"redirect to {_host_of(target)} refused"
+            if hops >= MAX_REDIRECT_HOPS:
+                return labelled, f"redirect loop: more than {MAX_REDIRECT_HOPS} hops"
+            hops += 1
+            url = target
+
+    async def _take_token(self, d: _Domain) -> None:
+        while True:
+            d.bucket, wait = acquire(d.bucket, self._clock())
+            if wait <= 0:
+                return
+            await self._sleep(wait)
+
+    async def _robots_parsed(self, d: _Domain, result: FetchResult) -> None:
+        policy = RobotsPolicy.from_response(result.status, result.text())
+        crawl_delay = policy.crawl_delay(self._settings.user_agent)
+        d.bucket = apply_crawl_delay(d.bucket, crawl_delay)
+        d.policy = policy
+        # A Crawl-delay beyond what we are willing to wait is the site asking for (almost)
+        # no traffic: honour it by stopping, like an over-long Retry-After, instead of
+        # crawling at one page an hour.
+        claimed = (
+            crawl_delay is not None
+            and crawl_delay > self._settings.max_crawl_delay_s
+            and self._claim_stop(
+                d,
+                f"robots.txt Crawl-delay {crawl_delay:g}s exceeds the "
+                f"{self._settings.max_crawl_delay_s:g}s limit",
+            )
+        )
+        await self._sink.on_robots(d.name, policy, result)
+        if claimed:
+            await self._announce_stop(d)
+
+    async def _robots_unreachable(self, d: _Domain, result: FetchResult, why: str) -> None:
+        """Not knowing the rules is not permission: stop the domain (reset by the next run)."""
+        d.policy = RobotsPolicy.from_response(None, None)  # disallow all, for the summary
+        claimed = self._claim_stop(d, f"robots.txt unreachable: {why}")
+        await self._sink.on_robots(d.name, d.policy, result)
+        if claimed:
+            await self._announce_stop(d)
 
     # --- stopping ----------------------------------------------------------------------------
 
@@ -464,3 +658,11 @@ class PoliteScheduler:
             for waiter in waiters:
                 waiter.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
+
+
+def _robots_answered(result: FetchResult) -> bool:
+    """True when robots.txt gave an answer to act on: 2xx (rules) or a 4xx other than 429 (none)."""
+    if result.error is not None or result.status is None:
+        return False
+    family = result.status // 100
+    return family == 2 or (family == 4 and result.status != 429)  # noqa: PLR2004

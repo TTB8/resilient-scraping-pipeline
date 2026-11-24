@@ -20,6 +20,12 @@ Rules worth knowing:
   (detection, never evasion);
 * results recorded while ``open`` are ignored: they come from requests sent before it opened, and
   only the probe may close the breaker;
+* **stale results** are ignored too. Every opening starts a new *generation*
+  (:func:`generation`); the caller notes it when :func:`allow` grants a request and hands it back to
+  :func:`record`. A result from an earlier generation was sent before the latest opening, so it
+  describes the server as it was then: it neither answers for the half-open probe (a slow request
+  returning ``ok`` while the probe is still out must not close the breaker) nor counts towards or
+  resets a closed breaker's failures. A refusal still trips at once, whenever it was sent;
 * ``max_open_cycles`` is the number of times the breaker may open and then probe. The opening after
   that trips it. With ``max_open_cycles=3`` a domain gets three cooldowns, and the fourth opening
   stops it;
@@ -130,8 +136,29 @@ def allow(state: BreakerState, now: float) -> tuple[BreakerState, bool]:
     return state, False  # HALF_OPEN (probe already out) or TRIPPED
 
 
-def record(state: BreakerState, response_class: ResponseClass, now: float) -> BreakerState:
-    """Feed the result of a request to this domain into the breaker."""
+def generation(state: BreakerState) -> int:
+    """The breaker's current generation: how many times it has opened in this run.
+
+    Read it right after :func:`allow` grants a request and pass it to :func:`record` with that
+    request's result.
+    """
+    return state.open_cycles
+
+
+def record(
+    state: BreakerState,
+    response_class: ResponseClass,
+    now: float,
+    *,
+    sent_in: int,
+) -> BreakerState:
+    """Feed the result of a request to this domain into the breaker.
+
+    ``sent_in`` is the :func:`generation` the request was granted in (read it right after
+    :func:`allow` said yes). A result from an older generation is stale (see the module docstring)
+    and only a refusal can still change the state. It is required, with no default: a caller that
+    forgot it would silently get the unsafe behaviour back.
+    """
     if state.phase in (BreakerPhase.TRIPPED, BreakerPhase.OPEN):
         return state
     if response_class in _REFUSED:
@@ -141,6 +168,8 @@ def record(state: BreakerState, response_class: ResponseClass, now: float) -> Br
             open_until=None,
             reason=f"tripped: the site answered {response_class}",
         )
+    if sent_in < state.open_cycles:
+        return state  # sent before the latest opening: not the probe, not news about the present
     if state.phase is BreakerPhase.HALF_OPEN:
         return _record_probe(state, response_class, now)
     return _record_closed(state, response_class, now)

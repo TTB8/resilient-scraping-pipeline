@@ -131,6 +131,10 @@ class FetchStageResult:
     reset: int
     links_added: int
     attempts: int
+    """Page attempts recorded in the frontier."""
+    requests: int | None
+    """Every HTTP request the site saw (robots.txt and redirect hops included), from the
+    scheduler's summary; ``None`` when the run was interrupted before it could report."""
     by_class: dict[ResponseClass, int]
     statuses: dict[FrontierStatus, int]
     """Frontier counts after the run (every status, zero included)."""
@@ -376,9 +380,10 @@ def run_fetch(
                 return await scheduler.run(feeder.entries())
 
         interrupted = False
+        summary: CrawlSummary | None = None
         if initial:
             try:
-                runner(crawl())
+                summary = runner(crawl())
             except (KeyboardInterrupt, asyncio.CancelledError):
                 interrupted = True
         sink = sinks[0] if sinks else None
@@ -388,6 +393,7 @@ def run_fetch(
             reset=reset,
             links_added=len(planned) + (sink.links_added if sink else 0),
             attempts=sink.attempts if sink else 0,
+            requests=summary.requests if summary is not None else (None if interrupted else 0),
             by_class=dict(sorted((sink.by_class if sink else Counter()).items())),
             statuses=store.counts(site),
             domains_stopped_now=dict(sorted((sink.domains_stopped if sink else {}).items())),
@@ -401,6 +407,7 @@ def run_fetch(
             "reset": result.reset,
             "links_added": result.links_added,
             "attempts": result.attempts,
+            "requests": result.requests,
             "by_class": {k.value: v for k, v in result.by_class.items()},
             "statuses": {k.value: v for k, v in result.statuses.items()},
             "domains_stopped_now": result.domains_stopped_now,

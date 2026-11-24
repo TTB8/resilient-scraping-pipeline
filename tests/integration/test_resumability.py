@@ -26,7 +26,7 @@ from scraping_pipeline.core.types import FrontierStatus, ResponseClass, Site
 from scraping_pipeline.stages import run_discover, run_fetch
 from scraping_pipeline.storage.cache import PageCache
 from scraping_pipeline.storage.state import RunStatus, StateStore
-from stage_support import server_settings
+from stage_support import server_settings, settled_urls
 
 pytestmark = pytest.mark.slow
 
@@ -94,12 +94,18 @@ def test_ctrl_c_midway_then_resume_fetches_nothing_twice(
     with StateStore.open(settings.state_db) as store:
         assert store.runs(Site.QUOTES)[-1].status is RunStatus.INTERRUPTED
     after_kill = len(_pages(server))
+    settled = {url.removeprefix(server.base_url) for url in settled_urls(settings, Site.QUOTES)}
+    assert len(settled) >= 4
 
     second = run_fetch(settings, Site.QUOTES)
     assert not second.interrupted
     assert second.statuses[FrontierStatus.PENDING] == 0
-    assert len(_pages(server)) > after_kill  # the second run did real work ...
-    assert max(Counter(_pages(server)).values()) == 1  # ... and asked for nothing twice
+    resumed = _pages(server)[after_kill:]
+    assert resumed  # the second run did real work ...
+    # ... and asked for no page whose result was recorded before the kill. An attempt that was
+    # in flight (say between a redirect and its hop) was abandoned and is rightly redone.
+    assert not settled & set(resumed)
+    assert max(Counter(resumed).values()) == 1
     assert _final_state(settings, server.base_url) == _uninterrupted(tmp_path, make_fixture_server)
 
 
@@ -126,11 +132,15 @@ def test_crash_between_cache_put_and_record_result_is_recovered_without_refetch(
     monkeypatch.setattr(StateStore, "record_result", real)
     assert PageCache(settings.cache_dir).has(victim)
     assert _pages(server).count("/page/2/") == 1
+    after_crash = len(_pages(server))
+    settled = {url.removeprefix(server.base_url) for url in settled_urls(settings, Site.QUOTES)}
 
     second = run_fetch(settings, Site.QUOTES)
     assert second.recovered == 1
     assert _pages(server).count("/page/2/") == 1  # recovered from the cache, not refetched
-    assert max(Counter(_pages(server)).values()) == 1
+    resumed = _pages(server)[after_crash:]
+    assert not settled & set(resumed)
+    assert max(Counter(resumed).values()) == 1
     with StateStore.open(settings.state_db) as store:
         recovered = store.get(victim)
         attempts = store.attempts(victim)

@@ -252,3 +252,30 @@ def test_ensure_dir_tolerates_concurrent_creation(
 )
 def test_is_temp_name(name: str, expected: bool) -> None:
     assert is_temp_name(name) is expected
+
+
+@pytest.mark.skipif(not hasattr(os, "O_ACCMODE"), reason="needs fcntl access-mode flags")
+def test_atomic_path_fsyncs_through_a_writable_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Emulate Windows, where fsync (FlushFileBuffers) fails with EBADF on a read-only descriptor."""
+    import errno  # noqa: PLC0415 - only this test needs it
+    import fcntl  # noqa: PLC0415 - POSIX-only module, guarded by the skipif
+
+    real_fsync = os.fsync
+    file_syncs: list[int] = []
+
+    def windows_like_fsync(fd: int) -> None:
+        read_only = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        if read_only:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        file_syncs.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", windows_like_fsync)
+    target = tmp_path / "out.parquet"
+    with atomic_path(target) as temp:
+        temp.write_bytes(b"columns")
+    assert target.read_bytes() == b"columns"
+    assert len(file_syncs) == 1  # the file was synced; the read-only directory fsync was skipped
+    assert _leftovers(tmp_path) == []
