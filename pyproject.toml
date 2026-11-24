@@ -59,7 +59,10 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # A stuck real-time test (a scheduler that never finishes) fails after 60s instead of hanging CI.
 timeout = 60
-markers = ["browser: needs Playwright Chromium installed"]
+markers = [
+    "browser: needs Playwright Chromium installed",
+    "slow: heavy property tests; skipped by the fast harness check, run in full and CI",
+]
 
 [tool.coverage.run]
 source = ["scraping_pipeline"]

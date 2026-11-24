@@ -4,6 +4,7 @@ import gzip
 import tempfile
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -27,6 +28,7 @@ urls = st.lists(_segment, min_size=1, max_size=3).map(
 pages = st.dictionaries(urls, st.binary(max_size=256), min_size=0, max_size=12)
 
 
+@pytest.mark.slow
 @settings(max_examples=60, deadline=None)
 @given(data=st.data(), contents=pages)
 def test_manifest_is_independent_of_insertion_order(
@@ -48,6 +50,7 @@ def test_manifest_is_independent_of_insertion_order(
             assert a.read_body(entry) == contents[entry.url]
 
 
+@pytest.mark.slow
 @settings(max_examples=40, deadline=None)
 @given(contents=pages, extra_url=urls, extra_body=st.binary(max_size=64))
 def test_manifest_changes_when_any_page_changes(

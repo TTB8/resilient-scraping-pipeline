@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -216,6 +217,7 @@ def book_candidates(draw: st.DrawFn) -> Candidate[BookDraft]:
     return Candidate(draft, _lineage(url, contract))
 
 
+@pytest.mark.slow
 @settings(max_examples=400)
 @given(rows=st.lists(book_candidates(), max_size=12))
 def test_book_validation_never_loses_a_row(rows: list[Candidate[BookDraft]]) -> None:
@@ -264,6 +266,7 @@ def quotes_dataset(draw: st.DrawFn) -> QuotesDataset:
     )
 
 
+@pytest.mark.slow
 @settings(max_examples=400)
 @given(dataset=quotes_dataset())
 def test_quote_validation_never_loses_a_row(dataset: QuotesDataset) -> None:
