@@ -408,6 +408,31 @@ async def test_robots_unreachable_skips_the_whole_domain() -> None:
     assert crawl.sink.finals()[u("/a")].status is FrontierStatus.SKIPPED_ROBOTS
 
 
+async def test_robots_crawl_delay_beyond_the_limit_stops_the_domain() -> None:
+    robots = ok("User-agent: *\nCrawl-delay: 3600\n", content_type="text/plain")
+    urls = [u("/a"), u("/b")]
+    crawl = Crawl({ROBOTS: robots, **{x: ok() for x in urls}}, max_crawl_delay_s=60)
+    summary = await crawl.run(urls)
+
+    assert crawl.page_calls() == []
+    assert {e.status for e in crawl.sink.finals().values()} == {FrontierStatus.STOPPED}
+    (stop,) = crawl.sink.of("stopped")
+    assert stop.reason is not None
+    assert "Crawl-delay 3600s exceeds the 60s limit" in stop.reason
+    # The stop is announced after the robots event that caused it.
+    kinds = [e.kind for e in crawl.sink.events]
+    assert kinds.index("robots") < kinds.index("stopped")
+    assert summary.domains_stopped == {"quotes.example.test": stop.reason}
+
+
+async def test_robots_crawl_delay_at_the_limit_is_honoured_not_stopped() -> None:
+    robots = ok("User-agent: *\nCrawl-delay: 60\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: robots, u("/a"): ok()}, max_crawl_delay_s=60)
+    summary = await crawl.run([u("/a")])
+    assert crawl.page_calls() == [u("/a")]
+    assert summary.domains_stopped == {}
+
+
 async def test_robots_crawl_delay_caps_the_rate() -> None:
     urls = [u(f"/d{n}") for n in range(4)]
     robots = ok("User-agent: *\nCrawl-delay: 3\n", content_type="text/plain")

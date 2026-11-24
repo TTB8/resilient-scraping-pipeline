@@ -63,6 +63,11 @@ class Settings(BaseSettings):
         gt=0,
         description="A Retry-After longer than this stops the domain instead of waiting.",
     )
+    max_crawl_delay_s: float = Field(
+        60.0,
+        gt=0,
+        description="A robots.txt Crawl-delay longer than this stops the domain instead of crawling.",
+    )
     breaker_failure_threshold: int = Field(
         5, ge=1, description="Consecutive transient failures that open a domain's breaker."
     )

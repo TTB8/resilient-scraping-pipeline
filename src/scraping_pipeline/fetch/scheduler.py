@@ -405,11 +405,24 @@ class PoliteScheduler:
                 # the rules: RobotsPolicy treats "unreachable" as disallow-all.
                 status = result.status if result.error is None else None
                 policy = RobotsPolicy.from_response(status, result.text())
-                d.bucket = apply_crawl_delay(
-                    d.bucket, policy.crawl_delay(self._settings.user_agent)
-                )
+                crawl_delay = policy.crawl_delay(self._settings.user_agent)
+                d.bucket = apply_crawl_delay(d.bucket, crawl_delay)
                 d.policy = policy
+                # A Crawl-delay beyond what we are willing to wait is the site asking for (almost)
+                # no traffic: honour it by stopping, like an over-long Retry-After, instead of
+                # crawling at one page an hour.
+                claimed = (
+                    crawl_delay is not None
+                    and crawl_delay > self._settings.max_crawl_delay_s
+                    and self._claim_stop(
+                        d,
+                        f"robots.txt Crawl-delay {crawl_delay:g}s exceeds the "
+                        f"{self._settings.max_crawl_delay_s:g}s limit",
+                    )
+                )
                 await self._sink.on_robots(d.name, policy, result)
+                if claimed:
+                    await self._announce_stop(d)
             return d.policy
 
     # --- stopping ----------------------------------------------------------------------------
