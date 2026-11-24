@@ -1,0 +1,196 @@
+"""The run report model and its deterministic Markdown rendering (golden strings)."""
+
+from decimal import Decimal
+
+from scraping_pipeline.core.report import (
+    DomainStop,
+    PageCounts,
+    ParseCoverage,
+    RunReport,
+    ValidationSummary,
+    render_markdown,
+)
+from scraping_pipeline.core.types import ResponseClass, Site
+from scraping_pipeline.core.validate import ValidationReport, Verdict
+
+FULL = RunReport(
+    site=Site.BOOKS,
+    fetch_run_id="fetch-20261124",
+    parse_run_id="9cf173d472b1ea7b",
+    started_at="2026-11-24T10:00:00Z",
+    finished_at="2026-11-24T10:35:12Z",
+    duration_s=2112.5,
+    pages=PageCounts(
+        discovered=1052,
+        fetched=1049,
+        failed_by_class={ResponseClass.TIMEOUT: 1, ResponseClass.NOT_FOUND: 2},
+    ),
+    domains_stopped=(
+        DomainStop(
+            domain="z.test",
+            reason="403 | access denied\non every page",
+            response_class=ResponseClass.BLOCKED,
+        ),
+        DomainStop(domain="a.test", reason="breaker open"),
+    ),
+    parse=ParseCoverage(
+        item_pages_fetched=1000, item_pages_with_records=999, records_parsed=999, warnings=3
+    ),
+    validation=ValidationSummary(
+        contract_version="books/1.0.0",
+        total_rows=999,
+        valid_rows=997,
+        quarantined_rows=2,
+        failure_rate=Decimal("0.0020"),
+        max_failure_rate=Decimal("0.01"),
+        rule_counts={"unknown_category": 1, "duplicate_key": 1},
+        verdict=Verdict.PASS,
+        verdict_reason="2 of 999 rows quarantined, within max rate 0.01",
+    ),
+)
+
+GOLDEN_FULL = """\
+# Run report: books
+
+| | |
+|---|---|
+| Fetch run | `fetch-20261124` |
+| Parse run | `9cf173d472b1ea7b` |
+| Started | 2026-11-24T10:00:00Z |
+| Finished | 2026-11-24T10:35:12Z |
+| Duration | 2112.50 s |
+
+## Pages
+
+- Discovered: 1052
+- Fetched: 1049
+- Failed: 3
+
+| Response class | Pages |
+|---|---:|
+| not_found | 2 |
+| timeout | 1 |
+
+## Domains stopped
+
+| Domain | Class | Reason |
+|---|---|---|
+| a.test | n/a | breaker open |
+| z.test | blocked | 403 \\| access denied on every page |
+
+## Parse
+
+- Item pages fetched: 1000
+- Item pages with records: 999 (coverage 99.90%)
+- Records parsed: 999
+- Warnings: 3
+
+## Validation
+
+- Contract: `books/1.0.0`
+- Verdict: **PASS**: 2 of 999 rows quarantined, within max rate 0.01
+- Rows: 999 total, 997 valid, 2 quarantined
+- Failure rate: 0.0020 (max 0.01)
+
+| Rule | Failures |
+|---|---:|
+| duplicate_key | 1 |
+| unknown_category | 1 |
+"""
+
+EMPTY = RunReport(
+    site=Site.QUOTES_JS,
+    fetch_run_id="f",
+    started_at="a",
+    finished_at="b",
+    duration_s=0,
+    pages=PageCounts(discovered=0, fetched=0),
+)
+
+GOLDEN_EMPTY = """\
+# Run report: quotes-js
+
+| | |
+|---|---|
+| Fetch run | `f` |
+| Parse run | `n/a` |
+| Started | a |
+| Finished | b |
+| Duration | 0.00 s |
+
+## Pages
+
+- Discovered: 0
+- Fetched: 0
+- Failed: 0
+
+## Domains stopped
+
+None.
+
+## Parse
+
+Not run.
+
+## Validation
+
+Not run.
+"""
+
+
+def test_full_report_matches_golden() -> None:
+    assert render_markdown(FULL) == GOLDEN_FULL
+
+
+def test_report_before_parse_and_validate_matches_golden() -> None:
+    assert render_markdown(EMPTY) == GOLDEN_EMPTY
+
+
+def test_rendering_ignores_mapping_insertion_order() -> None:
+    shuffled = FULL.model_copy(
+        update={
+            "pages": PageCounts(
+                discovered=1052,
+                fetched=1049,
+                failed_by_class={ResponseClass.NOT_FOUND: 2, ResponseClass.TIMEOUT: 1},
+            ),
+            "domains_stopped": tuple(reversed(FULL.domains_stopped)),
+        }
+    )
+    assert render_markdown(shuffled) == GOLDEN_FULL
+
+
+def test_report_round_trips_through_json() -> None:
+    assert RunReport.model_validate_json(FULL.model_dump_json()) == FULL
+
+
+def test_coverage_ratio() -> None:
+    assert FULL.parse is not None
+    assert FULL.parse.coverage == Decimal("0.999")
+    assert FULL.pages.failed == 3
+    none = ParseCoverage(
+        item_pages_fetched=0, item_pages_with_records=0, records_parsed=0, warnings=0
+    )
+    assert none.coverage is None
+    shown = render_markdown(FULL.model_copy(update={"parse": none}))
+    assert "- Item pages with records: 0 (coverage n/a)" in shown
+
+
+def test_summary_from_validation_report_drops_row_failures() -> None:
+    report = ValidationReport(
+        contract_version="quotes/1.0.0",
+        total_rows=1,
+        valid_rows=0,
+        quarantined_rows=1,
+        failure_rate=Decimal("1.0000"),
+        max_failure_rate=Decimal(0),
+        rule_counts={"missing": 1},
+        failures=(),
+        verdict=Verdict.FAIL,
+        verdict_reason="1 of 1 rows quarantined, above max rate 0",
+    )
+    summary = ValidationSummary.from_report(report)
+    assert summary.model_dump() == report.model_dump(exclude={"failures"})
+    shown = render_markdown(FULL.model_copy(update={"validation": summary}))
+    assert "- Verdict: **FAIL**: 1 of 1 rows quarantined, above max rate 0" in shown
+    assert "| missing | 1 |" in shown
