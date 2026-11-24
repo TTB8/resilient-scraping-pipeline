@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import csv
 import json
+from decimal import Decimal
 from pathlib import Path
+from typing import Annotated
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import BaseModel, Field
 
 from scraping_pipeline.config import Settings
-from scraping_pipeline.core.frontier import FrontierEntry, mark_stopped
+from scraping_pipeline.core.frontier import FrontierEntry, mark_skipped_robots, mark_stopped
 from scraping_pipeline.core.lineage import derive_parse_run_id
 from scraping_pipeline.core.parsers import books as books_parser
 from scraping_pipeline.core.types import FrontierStatus, PageKind, ResponseClass, Site
@@ -18,7 +22,7 @@ from scraping_pipeline.core.validate import Verdict
 from scraping_pipeline.fetch.fake import FakeFetcher
 from scraping_pipeline.stages import run_export, run_parse, run_validate
 from scraping_pipeline.stages.common import SitePaths, StageInputError, read_jsonl
-from scraping_pipeline.stages.export import QUARANTINE_COLUMNS
+from scraping_pipeline.stages.export import QUARANTINE_COLUMNS, _page_counts, arrow_schema
 from scraping_pipeline.storage.cache import FetchMeta, PageCache
 from scraping_pipeline.storage.state import (
     DomainEvent,
@@ -227,6 +231,11 @@ def test_export_writes_empty_tables_and_quarantine_lines(quotes_settings: Settin
     assert [int(line["row"]) for line in lines] == list(range(14))
     quotes = pq.read_table(out / "quotes.parquet")
     assert quotes.column("tags").type.value_type == "string"
+    ids = quotes.column("quote_id").to_pylist()
+    assert len(ids) == 6
+    assert ids == sorted(ids)  # sorted by the site's key, not by page or source
+    with (out / "quotes.csv").open(encoding="utf-8", newline="") as handle:
+        assert [row["quote_id"] for row in csv.DictReader(handle)] == ids
     with StateStore.open(quotes_settings.state_db) as store:
         fetch_run = [r for r in store.runs(Site.QUOTES) if r.stage is Stage.FETCH][-1]
     assert result.report.fetch_run_id == fetch_run.run_id
@@ -294,3 +303,56 @@ def test_parse_validate_export_twice_gives_the_same_bytes(quotes_settings: Setti
     first = once()
     assert len(first) == 12  # 3 parsed, 4 validated, 5 deliverables
     assert once() == first
+
+
+class _Floaty(BaseModel):
+    ratio: float
+
+
+class _Mixed(BaseModel):
+    value: int | str
+
+
+class _Unscaled(BaseModel):
+    price: Decimal
+
+
+class _Counts(BaseModel):
+    counts: tuple[int, ...]
+
+
+class _Whole(BaseModel):
+    pence: Annotated[Decimal, Field(decimal_places=0)]
+
+
+@pytest.mark.parametrize(
+    ("model", "message"),
+    [
+        (_Floaty, "no Arrow mapping"),
+        (_Mixed, "unsupported union"),
+        (_Unscaled, "needs decimal_places"),
+        (_Counts, "no Arrow mapping"),
+    ],
+)
+def test_arrow_schema_refuses_types_it_would_have_to_guess(
+    model: type[BaseModel], message: str
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        arrow_schema(model)
+
+
+def test_arrow_schema_keeps_a_zero_decimal_scale() -> None:
+    assert arrow_schema(_Whole).field("pence").type == pa.decimal128(18, 0)
+
+
+def test_page_counts_leave_out_robots_skips_and_unexplained_stops(tmp_path: Path) -> None:
+    settings = stage_settings(tmp_path)
+    skipped = FrontierEntry("https://quotes.toscrape.com/a", Site.QUOTES, PageKind.LISTING, 0)
+    stopped = FrontierEntry("https://quotes.toscrape.com/b", Site.QUOTES, PageKind.LISTING, 0)
+    with StateStore.open(settings.state_db) as store:
+        store.start_run("r", Site.QUOTES, Stage.FETCH, "2026-11-24T00:00:00+00:00", "{}")
+        store.add_entries([skipped, stopped], "r")
+        store.record_result("r", skipped, mark_skipped_robots(skipped, "robots"), None)
+        store.record_result("r", stopped, mark_stopped(stopped, "stopped"), None)
+        counts = _page_counts(store, Site.QUOTES)
+    assert (counts.discovered, counts.fetched, counts.failed_by_class) == (2, 0, {})

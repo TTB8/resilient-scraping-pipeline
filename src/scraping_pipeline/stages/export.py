@@ -129,7 +129,9 @@ def _arrow_type(annotation: Any, metadata: list[Any], where: str) -> tuple[pa.Da
     elif annotation is date:
         return pa.date32(), nullable
     elif annotation is Decimal:
-        scales = [m.decimal_places for m in metadata if getattr(m, "decimal_places", None)]
+        scales = [
+            m.decimal_places for m in metadata if getattr(m, "decimal_places", None) is not None
+        ]
         if not scales:
             raise TypeError(f"{where}: a Decimal column needs decimal_places in its contract")
         return pa.decimal128(DECIMAL_PRECISION, scales[0]), nullable
