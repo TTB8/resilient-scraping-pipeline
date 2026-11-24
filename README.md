@@ -107,9 +107,13 @@ make demo                                       # offline: runs against a local 
 uv run pipeline run --site books --max-depth 1  # live: about 70 pages at 1 request per second
 ```
 
-`make demo` runs the books site cleanly, then a quotes site that starts rate-limiting and then
-serves a block page. You see the pipeline back off, stop the domain, explain why in the report,
-and still deliver what it fetched (exit code 3).
+`make demo` runs the books site cleanly (exit code 0), then the quotes site while the local server
+pushes back. `/page/2/` first answers `429` with `Retry-After: 1`: the pipeline slows the domain
+down and fetches it on a retry more than a second later. Then an author page answers `403` with a
+block page: the domain is stopped and nothing more is sent. The report names the block, and the
+valid rows (6 quotes, 2 authors) are still delivered, the rest quarantined with reasons (exit
+code 3). The demo prints the server's timeline and checks this story itself: it exits non-zero
+if any part of it does not hold, so CI catches a regression.
 
 Outputs go to `./data/output/<site>/`. Each stage can also be run on its own:
 

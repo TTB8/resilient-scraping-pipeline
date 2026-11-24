@@ -105,3 +105,19 @@ async def test_scenarios_play_in_order(fixture_server: FixtureServer) -> None:
     log = fixture_server.log()
     assert [hit.status for hit in log] == [200, 200, 503, 503, 200, 200]
 
+
+async def test_path_scenarios_count_only_their_own_path(fixture_server: FixtureServer) -> None:
+    fixture_server.path_scenario("/page/2/", Phase.rate_limited("1", times=1))
+    fixture_server.path_scenario("/author/Albert-Einstein/", Phase.block())
+    async with HttpxFetcher(make_settings()) as fetcher:
+        home = await fetcher.fetch(fixture_server.url("/"))
+        limited = await fetcher.fetch(fixture_server.url("/page/2/"))
+        again = await fetcher.fetch(fixture_server.url("/page/2/"))
+        blocked = [
+            (await fetcher.fetch(fixture_server.url("/author/Albert-Einstein/"))).status
+            for _ in range(2)
+        ]
+    assert (home.status, limited.status, again.status) == (200, 429, 200)
+    assert limited.headers["retry-after"] == "1"
+    assert b'class="quote"' in again.body
+    assert blocked == [403, 403]
