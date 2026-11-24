@@ -163,9 +163,7 @@ before any stage with exit code 2 and a message naming `/data`. CI runs this mou
 ## A real run report
 
 From the committed [example output](examples/): `pipeline run --site quotes` against the live
-site, the whole site. (The examples predate two report lines added since: `Pages fetched by`, the
-fetch runs behind the rows, and the request total over those runs. On a first run both equal the
-figures shown.)
+site, the whole site.
 
 ```markdown
 ## Pages
@@ -173,7 +171,9 @@ figures shown.)
 - Discovered: 60
 - Fetched: 60
 - Failed: 0
-- HTTP requests (robots.txt and redirect hops included): 111
+- HTTP requests, latest fetch run (robots.txt and redirect hops included): 111
+- HTTP requests, all fetch runs behind these pages: 111
+- Same-host https to http redirect hops followed (ADR 0010): 50
 
 ## Domains stopped
 

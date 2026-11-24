@@ -25,11 +25,13 @@ Two details worth noticing in `quotes/run_report.md`:
 
 - **111 requests for 60 pages.** Every author link on that site redirects (`308`, to the same page
   with a trailing slash). Each hop is a real request, and each one waits for the rate limiter.
-- **The run that produced this folder was the second one.** The first one quarantined all 100
-  quotes, because the redirect also switches from `https` to `http` and the pipeline refused it as
-  off-site. The contract caught it as `unknown_author` instead of shipping quotes without authors.
-  The fix and its test are in the history (`fix(fetch): follow a same-host http<->https
-  redirect...`).
+- **50 same-host `https` to `http` hops followed.** Those author redirects also switch scheme. The
+  first live run of this site refused them as off-site and quarantined all 100 quotes: the
+  contract caught it as `unknown_author` instead of shipping quotes without authors. The fix and
+  its test are in the history (`fix(fetch): follow a same-host http<->https redirect...`). The
+  switch is now a per-site opt-in, on for the quotes sites only, and every such hop is counted in
+  the report, because that page crossed the network unencrypted
+  ([ADR 0010](../docs/decisions/0010-same-host-scheme-switch.md)).
 
 The data files (`.parquet`, `.csv`, `quarantine.csv`) are deterministic: re-running `parse`,
 `validate` and `export` on the same cache reproduces them byte for byte. The run reports carry

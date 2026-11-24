@@ -1,15 +1,21 @@
 {
   "site": "quotes",
-  "fetch_run_id": "fetch-20261124T114257396148Z-adeb3181",
-  "parse_run_id": "ecdb38dd4d2479d6",
-  "started_at": "2026-11-24T11:42:57.216478+00:00",
-  "finished_at": "2026-11-24T11:44:48.235099+00:00",
-  "duration_s": 111.018621,
+  "fetch_run_id": "fetch-20261124T144304479926Z-1b15c9b2",
+  "fetch_run_ids": [
+    "fetch-20261124T144304479926Z-1b15c9b2"
+  ],
+  "parse_run_id": "d23051da011e23fb",
+  "started_at": "2026-11-24T14:43:04.320108+00:00",
+  "finished_at": "2026-11-24T14:44:58.327620+00:00",
+  "duration_s": 114.007512,
   "pages": {
     "discovered": 60,
     "fetched": 60,
     "failed_by_class": {},
-    "http_requests": 111
+    "http_requests": 111,
+    "http_requests_total": 111,
+    "http_requests_unreported_runs": 0,
+    "scheme_downgrades": 50
   },
   "domains_stopped": [],
   "parse": {

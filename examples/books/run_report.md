@@ -2,18 +2,20 @@
 
 | | |
 |---|---|
-| Fetch run | `fetch-20261124T113839746297Z-0038acad` |
-| Parse run | `a77367703e6ff570` |
-| Started | 2026-11-24T11:38:39.589537+00:00 |
-| Finished | 2026-11-24T11:39:52.848239+00:00 |
-| Duration | 73.26 s |
+| Latest fetch run | `fetch-20261124T144459147962Z-1a5be1a6` |
+| Pages fetched by | `fetch-20261124T144459147962Z-1a5be1a6` |
+| Parse run | `6ac023c150733af2` |
+| Started | 2026-11-24T14:44:59.000277+00:00 |
+| Finished | 2026-11-24T14:46:11.971815+00:00 |
+| Duration | 72.97 s |
 
 ## Pages
 
 - Discovered: 72
 - Fetched: 72
 - Failed: 0
-- HTTP requests (robots.txt and redirect hops included): 73
+- HTTP requests, latest fetch run (robots.txt and redirect hops included): 73
+- HTTP requests, all fetch runs behind these pages: 73
 
 ## Domains stopped
 
