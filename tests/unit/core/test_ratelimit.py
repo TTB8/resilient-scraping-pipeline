@@ -136,3 +136,21 @@ def test_state_is_immutable() -> None:
     with pytest.raises(AttributeError):
         bucket.tokens = 5  # type: ignore[misc]
     assert isinstance(bucket, TokenBucket)
+
+
+@pytest.mark.parametrize("now", [2.0, None])
+def test_slow_down_restarts_the_refill_clock(now: float | None) -> None:
+    # Token taken at t=0; the request was slow and its 429 is seen at t=2. Without the restart, the
+    # 2 s since the last refill would buy a token at once (R1-11).
+    bucket, _ = acquire(new_bucket(1.0), 0.0)
+    bucket = slow_down(bucket, 0.5, 0.05, now=now)
+    bucket, wait = acquire(bucket, 2.0)
+    assert wait == pytest.approx(2.0)  # a full interval at the new rate of 0.5/s
+    bucket, wait = acquire(bucket, 4.0)
+    assert wait == 0.0
+
+
+def test_slow_down_ignores_a_clock_that_went_backwards() -> None:
+    bucket, _ = acquire(new_bucket(1.0), 10.0)
+    assert slow_down(bucket, now=5.0).updated_at == 10.0
+    assert slow_down(new_bucket(1.0), now=3.0).updated_at == 3.0

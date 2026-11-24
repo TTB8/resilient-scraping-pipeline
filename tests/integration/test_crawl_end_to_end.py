@@ -1,6 +1,8 @@
 """Scheduler + HttpxFetcher + fixture server, in real asyncio time with tiny settings."""
 
+import itertools
 import time
+from collections.abc import Callable
 
 from fetch_support import RecordingSink, make_settings
 from fixture_server import FixtureServer, Phase
@@ -75,3 +77,42 @@ async def test_clean_crawl_of_saved_pages(fixture_server: FixtureServer) -> None
     assert fixture_server.hits("/robots.txt") == 1
     done = [e for e in sink.of("result") if e.result is not None]
     assert all(b"quote" in e.result.body for e in done if e.result is not None)
+
+
+async def test_redirect_chain_stays_on_site(
+    make_fixture_server: Callable[..., FixtureServer],
+) -> None:
+    # Patrick's R1-01 repro, through the scheduler: four same-site hops, then a hop to another
+    # server. The same-site hops are followed (each with its own token); the off-site one is not.
+    site = make_fixture_server("quotes")
+    other = make_fixture_server("quotes")
+    for n in range(4):
+        site.redirect(f"/hop{n}", f"/hop{n + 1}")
+    site.redirect("/hop4", f"http://localhost:{other.port}/secret")
+    site.redirect("/moved", "/page/2/", status=301)
+    settings = make_settings(requests_per_second=5.0, burst=1, max_concurrency_per_domain=1)
+    sink = RecordingSink()
+    entries_ = [
+        FrontierEntry(url=site.url(p), site=Site.QUOTES, kind=PageKind.LISTING, depth=0)
+        for p in ("/hop0", "/moved")
+    ]
+    async with HttpxFetcher(settings) as fetcher:
+        summary = await PoliteScheduler(fetcher, settings, sink).run(entries_)
+
+    assert other.hits() == 0  # the other host never saw a request
+    finals = sink.finals()
+    refused = finals[site.url("/hop0")]
+    assert refused.status is FrontierStatus.FAILED_PERMANENT
+    assert "off-site redirect to localhost refused" in (refused.last_reason or "")
+    assert site.hits("/hop0") == 1  # permanent: not retried
+    moved = finals[site.url("/moved")]
+    assert moved.status is FrontierStatus.DONE
+    result = next(e.result for e in sink.of("result") if e.url == site.url("/moved"))
+    assert result is not None
+    assert result.final_url == site.url("/page/2/")
+    assert b'class="quote"' in result.body
+    # robots + 5 hops for /hop0 + 2 for /moved, all at <= 5 req/s with burst 1.
+    assert summary.requests == 1 + 5 + 2
+    times = [hit.at for hit in site.log()]
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    assert min(gaps) >= 0.2 - 0.02  # scheduler-side spacing, measured at the server

@@ -1,8 +1,12 @@
 """Per-domain token bucket, as immutable state: the politeness budget of the crawl.
 
-A token bucket allows short bursts (up to ``burst`` requests) and then exactly ``rate_per_s`` on
-average. Over *any* time window of length ``T`` it lets through at most ``burst + rate_per_s * T``
-requests, which is the guarantee that matters for a polite crawler, and the property the tests check.
+A token bucket allows short bursts (up to ``burst`` tokens) and then exactly ``rate_per_s`` on
+average. Over *any* time window of length ``T`` it grants at most ``burst + rate_per_s * T`` tokens,
+which is the guarantee that matters for a polite crawler, and the property the tests check. It
+bounds *requests* because the scheduler takes one token per HTTP request it sends: every redirect
+hop and every robots.txt attempt included (the fetchers never follow redirects on their own). The
+one documented exception is a rendered page's same-origin scripts in the Playwright fetcher, which
+ride on the document's token (see ``fetch/playwright_fetcher.py``).
 
 Three adjustments sit on top:
 
@@ -10,7 +14,9 @@ Three adjustments sit on top:
   ``1 / crawl_delay`` and the burst at 1, because "N seconds between requests" leaves no room for a
   burst;
 * :func:`slow_down` is the multiplicative decrease applied after a ``rate_limited`` response. It also
-  empties the bucket, so the next request waits a full interval at the new, lower rate;
+  empties the bucket *and restarts its refill clock*, so the next request waits a full interval at
+  the new, lower rate, counted from the moment the 429 was seen (not from the last token taken,
+  which may be long before when the 429'd request was slow);
 * :func:`speed_up` is a gentle additive recovery after successes, never above the ceiling (the
   configured rate, or the robots cap if lower). Additive increase with multiplicative decrease
   (AIMD) settles just under what the server tolerates instead of oscillating.
@@ -65,17 +71,27 @@ def acquire(state: TokenBucket, now: float) -> tuple[TokenBucket, float]:
     return refilled, wait
 
 
-def slow_down(state: TokenBucket, factor: float = 0.5, floor: float = 0.05) -> TokenBucket:
+def slow_down(
+    state: TokenBucket, factor: float = 0.5, floor: float = 0.05, *, now: float | None = None
+) -> TokenBucket:
     """Multiplicative decrease after a ``rate_limited`` response: ``rate * factor``, not below ``floor``.
 
-    Never raises the rate (when the rate is already under ``floor``, it stays where it is) and empties
-    the bucket so the next request waits a full interval.
+    Never raises the rate (when the rate is already under ``floor``, it stays where it is). Empties
+    the bucket and restarts the refill clock, so the next request waits a full interval at the new
+    rate: from ``now`` (when the 429 was seen) if given, else from the next :func:`acquire`. Without
+    the restart, the time since the last token was taken would refill the bucket at once.
     """
     if not 0.0 < factor < 1.0:
         raise ValueError(f"factor must be in (0, 1), got {factor!r}")
     _check_positive("floor", floor)
     rate = min(state.rate_per_s, max(floor, state.rate_per_s * factor))
-    return replace(state, rate_per_s=rate, tokens=0.0)
+    if now is None:
+        restarted = None
+    elif state.updated_at is None:
+        restarted = now
+    else:
+        restarted = max(state.updated_at, now)  # a clock going backwards is no time passing
+    return replace(state, rate_per_s=rate, tokens=0.0, updated_at=restarted)
 
 
 def speed_up(state: TokenBucket, step: float = 0.05) -> TokenBucket:

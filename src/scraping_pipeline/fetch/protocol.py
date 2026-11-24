@@ -47,7 +47,9 @@ class FetchResult:
     """The outcome of one fetch attempt, as plain data.
 
     ``headers`` keys are lower-cased (repeated headers are joined with ``", "``) and the mapping is
-    read-only. ``final_url`` is where redirects ended (equal to ``requested_url`` without any).
+    read-only. Fetchers never follow redirects, so a fetcher returns ``final_url == requested_url``
+    and a 3xx with its ``Location``; the scheduler follows same-origin hops itself and reports the
+    attempt with the entry's URL as ``requested_url`` and the last hop as ``final_url``.
     ``error_detail`` is a short human description of a transport error, for logs and the run
     report; it is never used for decisions.
     """
