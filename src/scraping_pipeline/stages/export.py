@@ -2,8 +2,11 @@
 
 Only rows that passed the contract are published, and they are re-checked on the way out: each
 line of ``validated/<table>.jsonl`` is parsed back through its contract model, so a hand-edited or
-stale staging file cannot reach a deliverable. Rows carry their ``parse_run_id``; one that differs
-from the current parse means ``validate`` was not re-run after ``parse``, and export refuses.
+stale staging file cannot reach a deliverable. Staleness is checked on everything export reads
+from ``validated/``, not only on the rows: ``validation_report.json`` records the
+``parse_run_id`` it validated, and every valid row and every quarantined row's lineage carries
+one. Any of them differing from the current parse (``parse_stats.json``) means ``validate`` was
+not re-run after ``parse``, and export refuses, even for a batch with no valid rows at all.
 
 Deliverables, under ``<data_dir>/output/<site>/``:
 
@@ -16,6 +19,13 @@ Deliverables, under ``<data_dir>/output/<site>/``:
   does not know raises, so a new contract field cannot be exported as a silently guessed type;
 * ``quarantine.csv``: one line per failure of every quarantined row;
 * ``run_report.json`` and ``run_report.md`` (``core.report``).
+
+**Not atomic as a set.** Each file is written atomically (``storage.atomic``: a temporary file,
+fsync, rename), but one file at a time, in the order above: the tables, ``quarantine.csv``, then
+the two run report files. A crash midway leaves every file whole, yet the directory can hold new
+files next to old ones from the previous export. Re-running ``export`` repairs it (it is a pure
+function of ``validated/``). A staging directory swapped in with one rename, or a manifest of
+checksums, would make the set atomic; that is not built.
 
 **A FAIL verdict still publishes the valid rows** (ADR 0004: report failures, never drop them):
 the tables hold only rows that passed the contract, ``quarantine.csv`` holds every other row with
@@ -177,20 +187,41 @@ def _load_table(paths: SitePaths, table: TableSpec, parse_run_id: str) -> list[d
             raise StageInputError(f"{path}:{number} breaks the contract: {exc}") from exc
         row = record.model_dump()
         if row.get("parse_run_id") != parse_run_id:
-            raise StageInputError(
-                f"{path} is from parse run {row.get('parse_run_id')}, not {parse_run_id}: "
-                "re-run validate"
-            )
+            raise _stale(path, row.get("parse_run_id"), parse_run_id)
         rows.append(row)
     return rows
 
 
-def _quarantine_rows(paths: SitePaths) -> list[dict[str, object]]:
+def _stale(path: object, found: object, parse_run_id: str) -> StageInputError:
+    return StageInputError(f"{path} is from parse run {found}, not {parse_run_id}: re-run validate")
+
+
+def _quarantine_rows(paths: SitePaths, parse_run_id: str) -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for index, row in enumerate(read_jsonl(paths.quarantine)):
-        for number, failure in enumerate(row["failures"]):
+        try:
+            found = row["lineage"]["parse_run_id"]
+            failures = list(row["failures"])
+        except (KeyError, TypeError) as exc:
+            raise StageInputError(f"{paths.quarantine}:{index + 1}: malformed row") from exc
+        if found != parse_run_id:
+            raise _stale(paths.quarantine, found, parse_run_id)
+        for number, failure in enumerate(failures):
             out.append({"row": index, "failure": number, **failure})
     return out
+
+
+def _load_validation(paths: SitePaths, parse_run_id: str) -> ValidationReport:
+    raw = read_json(paths.validation_report)
+    if not isinstance(raw, dict):
+        raise StageInputError(f"{paths.validation_report}: expected an object")
+    found = raw.pop("parse_run_id", None)
+    if found != parse_run_id:
+        raise _stale(paths.validation_report, found, parse_run_id)
+    try:
+        return ValidationReport.model_validate(raw)
+    except ValidationError as exc:
+        raise StageInputError(f"{paths.validation_report} is malformed: {exc}") from exc
 
 
 # --- report --------------------------------------------------------------------------------------
@@ -283,7 +314,8 @@ def run_export(settings: Settings, site: Site, *, started_at: str | None = None)
         stage_run(store, settings, site, Stage.EXPORT) as run,
     ):
         stats = read_json(paths.parse_stats)
-        validation = ValidationReport.model_validate(read_json(paths.validation_report))
+        validation = _load_validation(paths, stats["parse_run_id"])
+        quarantine = _quarantine_rows(paths, stats["parse_run_id"])
         rows_by_table: dict[str, int] = {}
         published: list[str] = []
         for table in spec.tables:
@@ -305,7 +337,7 @@ def run_export(settings: Settings, site: Site, *, started_at: str | None = None)
             published += [f"{table.name}.parquet", f"{table.name}.csv"]
         write_csv(
             paths.output / "quarantine.csv",
-            _quarantine_rows(paths),
+            quarantine,
             QUARANTINE_COLUMNS,
             sort_key=("row", "failure"),
         )
