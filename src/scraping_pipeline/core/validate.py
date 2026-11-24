@@ -12,7 +12,7 @@ Rules, in the order they run:
    draft field is passed as *absent*, so it is reported as rule ``missing`` rather than a type error.
 2. **Uniqueness** (``duplicate_key``) on ``book_id`` / ``quote_id`` / ``author_slug`` among the rows
    that passed the contract. Rows are first put in a canonical order (key, source URL, position,
-   content hash), and the first row of each key is kept; later ones are quarantined with a pointer to
+   content hash, then the draft's ``repr`` as a last tie-break), and the first row of each key is kept; later ones are quarantined with a pointer to
    the kept row's source. The choice is therefore deterministic whatever order the stage passes rows in.
 3. **Referential**: a book's category must be in the category set discovered on the home page
    (``unknown_category``); a quote's ``author_slug`` must name a *valid* author row (``unknown_author``),
@@ -194,7 +194,7 @@ def validate(dataset: Dataset, policy: ValidationPolicy | None = None) -> Valida
 class _Row:
     record_type: str
     key: str
-    order: tuple[str, int, str]
+    order: tuple[str, int, str, str]
     candidate: Candidate[Any]
     record: Record | None
     failures: list[Failure] = field(default_factory=list)
@@ -232,7 +232,14 @@ def _contract_rows[D: Draft](
         row = _Row(
             record_type=record_type,
             key=key,
-            order=(candidate.lineage.source_url, position, candidate.lineage.content_sha256),
+            # A total order: two rows with equal lineage but different drafts still sort the same way
+            # whatever order they arrive in (found by the property test on input order).
+            order=(
+                candidate.lineage.source_url,
+                position,
+                candidate.lineage.content_sha256,
+                repr(candidate.draft),
+            ),
             candidate=candidate,
             record=None,
         )
