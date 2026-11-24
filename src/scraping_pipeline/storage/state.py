@@ -72,7 +72,7 @@ from scraping_pipeline.core.frontier import (
 )
 from scraping_pipeline.core.types import FrontierStatus, PageKind, ResponseClass, Site
 from scraping_pipeline.core.urls import InvalidUrlError, canonicalize
-from scraping_pipeline.storage.cache import PageCache
+from scraping_pipeline.storage.cache import CacheEntry, CorruptCacheError, PageCache
 
 __all__ = [
     "DEFAULT_RESET_STATUSES",
@@ -316,7 +316,7 @@ class StateStore:
         with _OPEN_LOCK:
             existing = _OPEN.get(resolved)
             if existing is not None and not existing._closed:
-                raise StateLockedError(f"another pipeline process is using {resolved}")
+                raise StateLockedError(f"{resolved} is already open in this process")
             resolved.parent.mkdir(parents=True, exist_ok=True)
             try:
                 con = duckdb.connect(str(resolved))
@@ -658,19 +658,28 @@ class StateStore:
     def reconcile_with_cache(
         self, site: Site, cache: PageCache, run_id: str, now_epoch: float
     ) -> int:
-        """Mark ``DONE`` every non-final entry whose page is already in ``cache``; return the count.
+        """Mark ``DONE`` every ``PENDING`` entry whose page is intact in ``cache``; return the count.
 
         This repairs a crash between the cache write and :meth:`record_result`. Each recovered entry
         gets one synthetic attempt (``reason`` :data:`RECOVERED_REASON`, ``at = now_epoch``, the
         cached status and body hash, no ``elapsed_s``), because a real attempt did happen; it was
         just never recorded. Final entries are never touched. Running it again recovers 0.
+
+        A cache entry is trusted only when it could have come from a successful fetch *and* its
+        body is still there: the cached status is 2xx, and :meth:`PageCache.read_body` returns the
+        object (present, valid gzip, hashing to the recorded sha256). Anything else (a cached error
+        page, a dangling entry whose object is gone, a corrupt object) is **left exactly as it is**:
+        still ``PENDING``, no attempt row, nothing written. The entry is then simply fetched again,
+        and that real attempt, with its own row, is the lineage; the fresh ``PageCache.put``
+        replaces the bad entry and heals a damaged object. Recording a note instead would invent an
+        attempt that never happened, so the store records nothing for an untrusted entry.
         """
         self._require_run(run_id)
         pending = self.entries(site, {FrontierStatus.PENDING})
         recovered: list[tuple[FrontierEntry, FrontierEntry, AttemptRecord]] = []
         for before in pending:
             cached = cache.get_entry(before.url)
-            if cached is None:
+            if cached is None or not _recoverable(cache, cached):
                 continue
             after = FrontierEntry(
                 url=before.url,
@@ -712,10 +721,16 @@ class StateStore:
 
         **Attempts are kept, not reset.** ``attempts`` stays the lifetime count of attempts, which
         is also the 1-based number of the next attempt row, so history in ``fetch_attempts`` is
-        never renumbered or overwritten. Consequence: the retry budget (``max_attempts``) is
-        lifetime too. A ``FAILED_EXHAUSTED`` entry that is reset gets one more try; if that fails
-        transiently it is exhausted again. Raise ``max_attempts`` for that run to give it more.
-        ``next_attempt_at`` is cleared, ``last_class`` is kept and ``last_reason`` says it was reset.
+        never renumbered or overwritten. The retry budget is therefore lifetime too. Precisely,
+        with :func:`scraping_pipeline.core.retry.decide` giving up once ``attempt >= max_attempts``:
+        a reset entry with ``attempts = n`` is fetched once more as attempt ``n + 1``. If that ends
+        ``ok`` it becomes ``DONE``. If it fails transiently it is retried only while
+        ``n + 1 < max_attempts``. A ``FAILED_EXHAUSTED`` entry has ``n >= max_attempts``, so
+        under the same ``max_attempts`` it gets **exactly one** more attempt and is exhausted again
+        on a transient failure. A ``STOPPED`` entry keeps whatever budget it had left. A permanent
+        or refusing response (``not_found``, ``blocked``, ...) is final again whatever the count.
+        To grant more retries, run with a higher ``max_attempts``. ``next_attempt_at`` is cleared,
+        ``last_class`` is kept, and ``last_reason`` says the entry was reset and from which status.
         """
         self._require_run(run_id)
         wanted = {FrontierStatus(status) for status in statuses}
@@ -787,6 +802,17 @@ def _check_result(
             f"{before.url}: last_class {after.last_class} differs from the attempt's "
             f"{attempt.response_class}"
         )
+
+
+def _recoverable(cache: PageCache, cached: CacheEntry) -> bool:
+    """A cache entry from a successful fetch whose body is present and verifies."""
+    if not 200 <= cached.status < 300:  # noqa: PLR2004 - the HTTP success range
+        return False
+    try:
+        cache.read_body(cached)
+    except CorruptCacheError:
+        return False
+    return True
 
 
 def _entry_params(entry: FrontierEntry) -> list[object]:

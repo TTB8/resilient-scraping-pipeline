@@ -7,7 +7,10 @@ writers remove every source of variation that the usual one-liners let in:
 - **Row order.** Rows are sorted by caller-named ``sort_key`` columns before writing, so the order
   in which the parse stage happened to produce them never leaks into the file. The key must be
   unique: with ties, a stable sort would fall back to the input order, which is exactly the
-  variation we are removing, so duplicates raise :class:`SchemaMismatchError`. ``None`` sorts first.
+  variation we are removing, so duplicates raise :class:`SchemaMismatchError`. A key cell must
+  hold a real value: ``None`` and NaN (``float`` or ``Decimal``) raise :class:`SchemaMismatchError`,
+  because NaN compares unequal to everything (including itself), which silently breaks both the
+  sort order and the uniqueness check, and a missing key cannot identify a row.
 - **Columns.** Every row must have exactly the declared columns (Parquet: the schema's fields; CSV:
   ``columns``). Missing or extra keys raise instead of being silently nulled or dropped, and
   key insertion order in the row mappings does not matter.
@@ -20,12 +23,20 @@ writers remove every source of variation that the usual one-liners let in:
 - **CSV rendering.** UTF-8 without BOM, ``\\n`` line endings, minimal quoting, a fixed column order
   and one canonical text form per type (see :func:`render_csv_value`).
 
+**CSV is a data-interchange file, not a spreadsheet.** Cells are written byte-faithful to the
+data, including scraped text that starts with ``=``, ``+``, ``-`` or ``@``. Opening the CSV in a
+spreadsheet application can make it *execute* such a cell as a formula (CSV / formula injection).
+We deliberately do not prefix those cells with an apostrophe, the usual mitigation, because that
+would corrupt the value for every program that reads the file. To look at the data in a spreadsheet,
+use the Parquet file, or import the CSV with every column typed as text.
+
 All writes go through :mod:`scraping_pipeline.storage.atomic`, so a killed export leaves the
 previous deliverable intact rather than a truncated one.
 """
 
 import csv
 import io
+import math
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -169,6 +180,17 @@ def _render_scalar(value: object) -> str:  # noqa: PLR0911 - one return per type
     raise TypeError(f"cannot render {type(value).__name__} as a CSV cell: {value!r}")
 
 
+def _is_missing(value: object) -> bool:
+    """``None`` or a NaN, the values that cannot order or identify a row."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return math.isnan(value)
+    if isinstance(value, Decimal):
+        return value.is_nan()
+    return False
+
+
 def _sorted_rows(rows: Sequence[Row], names: Sequence[str], sort_key: Sequence[str]) -> list[Row]:
     """Check every row has exactly ``names`` and return them sorted by a unique ``sort_key``."""
     if not sort_key:
@@ -183,9 +205,15 @@ def _sorted_rows(rows: Sequence[Row], names: Sequence[str], sort_key: Sequence[s
             missing, extra = sorted(expected - keys), sorted(keys - expected)
             raise SchemaMismatchError(f"row {index}: missing columns {missing}, extra {extra}")
 
-    def key_of(row: Row) -> tuple[tuple[bool, object], ...]:
-        # (False, None) sorts before (True, value): None first, and None is never compared.
-        return tuple((row[key] is not None, row[key]) for key in sort_key)
+    for index, row in enumerate(rows):
+        for key in sort_key:
+            if _is_missing(row[key]):
+                raise SchemaMismatchError(
+                    f"row {index}: sort_key column {key!r} holds {row[key]!r}; key cells need a value"
+                )
+
+    def key_of(row: Row) -> tuple[object, ...]:
+        return tuple(row[key] for key in sort_key)
 
     try:
         ordered = sorted(rows, key=key_of)

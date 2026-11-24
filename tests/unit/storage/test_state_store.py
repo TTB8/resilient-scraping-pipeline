@@ -1,4 +1,5 @@
 import gc
+import gzip
 import os
 import signal
 import subprocess
@@ -179,7 +180,7 @@ def test_second_process_gets_state_locked_error(db_path: Path) -> None:
 
 def test_second_open_in_one_process_is_refused_until_closed_or_dropped(db_path: Path) -> None:
     first = StateStore.open(db_path)
-    with pytest.raises(StateLockedError):
+    with pytest.raises(StateLockedError, match="already open in this process"):
         StateStore.open(db_path)
     first.close()
     first.close()  # idempotent
@@ -428,6 +429,35 @@ def test_stale_before_raises_and_writes_nothing(store: StateStore) -> None:
     assert len(store.attempts(url(1))) == 1
 
 
+def _record_one_retry(store: StateStore) -> tuple[FrontierEntry, FrontierEntry]:
+    """Store `pending, attempts=1` (a retry with attempt row 1); return (stale copy, stored)."""
+    store.add_entries([entry(1)], "r1")
+    stale = store.get(url(1))
+    assert stale is not None
+    retried = apply_decision(stale, SERVER_ERROR, RetryDecision(RetryAction.RETRY, 2.0, "r"), 1.0)
+    store.record_result("r1", stale, retried, fail_attempt(retried))
+    assert (retried.status, retried.attempts) == (FrontierStatus.PENDING, 1)
+    return stale, retried
+
+
+def test_stale_attempts_with_same_status_raises_without_attempt_record(store: StateStore) -> None:
+    """Only `attempts` differs (pending in both): the stale writer must not rewind the counter."""
+    stale, stored = _record_one_retry(store)
+    with pytest.raises(StaleEntryError, match="expected status=pending attempts=0"):
+        store.record_result("r1", stale, mark_stopped(stale, "domain stopped"), None)
+    assert store.get(url(1)) == stored
+    assert [a.record.attempt for a in store.attempts(url(1))] == [1]
+
+
+def test_stale_attempts_with_same_status_raises_with_attempt_record(store: StateStore) -> None:
+    stale, stored = _record_one_retry(store)
+    late = apply_decision(stale, OK, None, now=5.0)
+    with pytest.raises(StaleEntryError, match="stored is status=pending attempts=1"):
+        store.record_result("r1", stale, late, ok_attempt(late))
+    assert store.get(url(1)) == stored
+    assert [a.record.reason for a in store.attempts(url(1))] == ["failed"]
+
+
 def test_stale_when_row_is_missing(store: StateStore) -> None:
     before = entry(1)
     after = apply_decision(before, OK, None, now=1.0)
@@ -531,11 +561,59 @@ def test_domain_events_round_trip_in_order(store: StateStore) -> None:
 # --- resumability ----------------------------------------------------------------------------
 
 
-def put(cache: PageCache, n: int, body: bytes = b"<html>page</html>") -> str:
+def put(cache: PageCache, n: int, body: bytes = b"<html>page</html>", status: int = 200) -> str:
     meta = FetchMeta(
-        final_url=url(n), status=200, fetched_at=T0, fetch_run_id="r1", fetcher="httpx"
+        final_url=url(n), status=status, fetched_at=T0, fetch_run_id="r1", fetcher="httpx"
     )
     return cache.put(url(n), body, meta).content_sha256
+
+
+def object_file(cache: PageCache, digest: str) -> Path:
+    return cache.root / "objects" / digest[:2] / f"{digest}.gz"
+
+
+@pytest.mark.parametrize(
+    ("status", "recovered"),
+    [(200, True), (204, True), (299, True), (199, False), (301, False), (404, False), (503, False)],
+)
+def test_reconcile_recovers_only_2xx_cache_entries(
+    store: StateStore, tmp_path: Path, status: int, recovered: bool
+) -> None:
+    cache = PageCache(tmp_path / "cache")
+    store.add_entries([entry(1)], "r1")
+    put(cache, 1, status=status)
+    assert store.reconcile_with_cache(Site.BOOKS, cache, "r1", now_epoch=9.0) == int(recovered)
+    stored = store.get(url(1))
+    assert stored is not None
+    if recovered:
+        assert stored.status is FrontierStatus.DONE
+        assert [a.record.http_status for a in store.attempts(url(1))] == [status]
+    else:
+        assert stored == entry(1)  # untouched: it will simply be fetched again
+        assert store.attempts(url(1)) == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "not_gzip", "wrong_body"])
+def test_reconcile_skips_entries_whose_object_is_missing_or_corrupt(
+    store: StateStore, tmp_path: Path, damage: str
+) -> None:
+    cache = PageCache(tmp_path / "cache")
+    store.add_entries([entry(1), entry(2)], "r1")
+    digest = put(cache, 1, b"page one")
+    put(cache, 2, b"page two")  # intact: recovered
+    path = object_file(cache, digest)
+    if damage == "missing":
+        path.unlink()
+    elif damage == "not_gzip":
+        path.write_bytes(b"\x00 not gzip")
+    else:
+        path.write_bytes(gzip.compress(b"some other body"))
+    assert store.reconcile_with_cache(Site.BOOKS, cache, "r1", now_epoch=9.0) == 1
+    assert store.get(url(1)) == entry(1)
+    assert store.attempts(url(1)) == []
+    done = store.get(url(2))
+    assert done is not None
+    assert done.status is FrontierStatus.DONE
 
 
 def test_reconcile_recovers_exactly_the_cached_pending_entries(
