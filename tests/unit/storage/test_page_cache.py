@@ -354,6 +354,17 @@ def test_manifest_does_not_depend_on_listing_order(
     assert cache.manifest_sha256() == expected
 
 
+def test_manifest_sorts_on_its_own_without_trusting_iter_entries(
+    cache: PageCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for n in range(10):
+        cache.put(f"https://quotes.toscrape.com/page/{n}/", f"b{n}".encode(), meta())
+    expected = cache.manifest_sha256()
+    entries = list(cache.iter_entries())
+    monkeypatch.setattr(PageCache, "iter_entries", lambda _self: iter(reversed(entries)))
+    assert cache.manifest_sha256() == expected
+
+
 def test_gzip_objects_are_deterministic() -> None:
     first = gzip_bytes(BODY)
     assert first == gzip_bytes(BODY)
