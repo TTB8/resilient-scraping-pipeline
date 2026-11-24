@@ -5,6 +5,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -41,8 +42,9 @@ def _batches(data: st.DataObject, frontier: dict[str, FrontierEntry]) -> list[li
     return [shuffled[a:b] for a, b in itertools.pairwise(bounds)]
 
 
-# Each example opens two databases (~0.15s each): 20 examples keep the fast checks in budget.
-@settings(max_examples=20, deadline=None)
+# Each example opens two databases (~0.15s each): marked slow, so it runs in full and CI only.
+@pytest.mark.slow
+@settings(max_examples=50, deadline=None)
 @given(data=st.data(), frontier=_frontiers, done_count=st.integers(0, 3))
 def test_any_interleaving_of_add_batches_yields_the_same_frontier(
     data: st.DataObject, frontier: dict[str, FrontierEntry], done_count: int
