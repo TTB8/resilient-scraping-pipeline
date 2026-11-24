@@ -666,7 +666,7 @@ async def test_same_origin_redirect_is_followed_as_a_new_request() -> None:
         ("http://169.254.169.254/latest/meta-data/", "169.254.169.254"),
         ("http://127.0.0.1:8080/admin", "127.0.0.1"),
         ("https://books.example.test/x", "books.example.test"),
-        ("http://quotes.example.test/a", "quotes.example.test"),  # other scheme
+        ("http://quotes.example.test:8080/a", "quotes.example.test"),  # scheme switch, odd port
         ("https://quotes.example.test:8443/a", "quotes.example.test"),  # other port
     ],
 )
@@ -679,6 +679,19 @@ async def test_off_site_redirect_is_refused_permanently(location: str, host: str
     assert final.status is FrontierStatus.FAILED_PERMANENT
     assert final.last_class is ResponseClass.CLIENT_ERROR
     assert f"off-site redirect to {host} refused" in (final.last_reason or "")
+
+
+async def test_same_host_scheme_switch_on_default_ports_is_followed() -> None:
+    # The live quotes site answers https://.../author/X with 308 to http://.../author/X/ (seen on
+    # the first real run; the saved fixtures already had the slash, so only a live run showed it).
+    target = "http://quotes.example.test/author/X/"
+    crawl = Crawl({u("/author/X"): redirect(target, status=308), target: ok("<html>author</html>")})
+    summary = await crawl.run([u("/author/X")])
+
+    assert crawl.fake.urls_called() == [ROBOTS, u("/author/X"), target]
+    final = crawl.sink.finals()[u("/author/X")]
+    assert final.status is FrontierStatus.DONE
+    assert (summary.attempts, summary.requests) == (1, 3)
 
 
 async def test_fetcher_that_followed_off_site_is_refused() -> None:

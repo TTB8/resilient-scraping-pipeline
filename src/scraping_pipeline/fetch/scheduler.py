@@ -225,6 +225,30 @@ def origin_of(url: str) -> tuple[str, str, int] | None:
     return scheme, parts.hostname.lower(), port if port is not None else _DEFAULT_PORTS[scheme]
 
 
+def same_site_origin(
+    origin: tuple[str, str, int] | None, home: tuple[str, str, int] | None
+) -> bool:
+    """True when a redirect to ``origin`` stays on the site whose origin is ``home``.
+
+    The same origin always does. So does a switch between ``http`` and ``https`` on the same host
+    when both sides use their scheme's default port: real sites redirect that way (the quotes
+    practice site answers ``https://.../author/X`` with ``308`` to ``http://.../author/X/``), and
+    it is the same server under the same name. A different host, or any non-default port, is
+    another site. The hop is still robots-checked against the rules already fetched for the host,
+    rate-limited and breaker-checked like every request.
+    """
+    if origin is None or home is None:
+        return False
+    if origin == home:
+        return True
+    (scheme, host, port), (home_scheme, home_host, home_port) = origin, home
+    return (
+        host == home_host
+        and port == _DEFAULT_PORTS[scheme]
+        and home_port == _DEFAULT_PORTS[home_scheme]
+    )
+
+
 def redirect_location(result: FetchResult) -> str | None:
     """The raw ``Location`` of a followable redirect answer, else ``None``."""
     if result.error is not None or result.status not in REDIRECT_STATUSES:
@@ -411,7 +435,7 @@ class PoliteScheduler:
             elapsed += result.elapsed_s
             verdict = self._observe(d, result, ticket)
             labelled = replace(result, requested_url=entry.url, final_url=url, elapsed_s=elapsed)
-            if origin_of(result.final_url) != home:  # the fetcher followed one by itself
+            if not same_site_origin(origin_of(result.final_url), home):  # fetcher followed one
                 return labelled, _refused(
                     f"off-site redirect to {_host_of(result.final_url)} refused"
                 )
@@ -438,7 +462,7 @@ class PoliteScheduler:
             target = canonicalize(urljoin(url, location))
         except InvalidUrlError:
             return None, _refused(f"redirect to {location!r} refused: not an http(s) URL")
-        if origin_of(target) != home:
+        if not same_site_origin(origin_of(target), home):
             return None, _refused(f"off-site redirect to {_host_of(target)} refused")
         if hops >= MAX_REDIRECT_HOPS:
             return None, _refused(f"redirect loop: more than {MAX_REDIRECT_HOPS} hops, at {target}")
