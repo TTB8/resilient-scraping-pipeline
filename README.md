@@ -131,9 +131,15 @@ For the JavaScript-rendered site: `make browsers`, then `uv run pipeline run --s
 **Docker:**
 
 ```bash
-docker build -t resilient-scraping-pipeline .                      # add --build-arg WITH_BROWSER=1 for quotes-js
-docker run --rm -v "$PWD/data:/data" resilient-scraping-pipeline run --site books --max-depth 1
+docker build -t resilient-scraping-pipeline .    # add --build-arg WITH_BROWSER=1 for quotes-js
+mkdir -p data
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/data:/data" \
+    resilient-scraping-pipeline run --site books --max-depth 1
 ```
+
+`--user` runs the container as you, so it can write the mounted `./data` (a bind mount keeps the
+host directory's owner, which the image's own user cannot write). Without it the pipeline stops
+before any stage with exit code 2 and a message naming `/data`. CI runs this mount.
 
 **Exit codes** are part of the interface, so a scheduler can react without reading logs:
 
