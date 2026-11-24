@@ -27,11 +27,14 @@ from stage_support import fast_fetch, saved_site_fetcher, stage_settings
 
 @pytest.fixture
 def make_fixture_server() -> Iterator[Callable[..., FixtureServer]]:
-    """Factory: ``make_fixture_server("books", robots_txt="...")``. Every server is stopped after."""
+    """Factory: ``make_fixture_server("books", robots_txt="...", gzip=True)``. Every server is
+    stopped after."""
     servers: list[FixtureServer] = []
 
-    def factory(site: str = "quotes", *, robots_txt: str | None = None) -> FixtureServer:
-        server = FixtureServer(site, robots_txt=robots_txt).start()
+    def factory(
+        site: str = "quotes", *, robots_txt: str | None = None, gzip: bool = False
+    ) -> FixtureServer:
+        server = FixtureServer(site, robots_txt=robots_txt, gzip=gzip).start()
         servers.append(server)
         return server
 

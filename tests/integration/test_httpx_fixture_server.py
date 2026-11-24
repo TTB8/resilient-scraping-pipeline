@@ -2,9 +2,10 @@
 
 import socket
 import time
+from collections.abc import Callable
 
 from fetch_support import make_settings
-from fixture_server import FixtureServer, Phase
+from fixture_server import SITES, FixtureServer, Phase
 from scraping_pipeline.core.classify import TransportError
 from scraping_pipeline.fetch.httpx_fetcher import HttpxFetcher
 
@@ -121,3 +122,32 @@ async def test_path_scenarios_count_only_their_own_path(fixture_server: FixtureS
     assert limited.headers["retry-after"] == "1"
     assert b'class="quote"' in again.body
     assert blocked == [403, 403]
+
+
+# --- R3-10: compressed answers and script types ------------------------------------------------
+
+
+async def test_a_gzip_answer_is_decoded_and_its_size_capped_after_decoding(
+    make_fixture_server: Callable[..., FixtureServer],
+) -> None:
+    server = make_fixture_server("quotes", gzip=True)
+    saved = (SITES / "quotes" / "page" / "2" / "index.html").read_bytes()
+    async with HttpxFetcher(make_settings()) as fetcher:
+        result = await fetcher.fetch(server.url("/page/2/"))
+    assert result.status == 200
+    assert result.error is None
+    assert result.headers["content-encoding"] == "gzip"  # it really went compressed
+    assert int(result.headers["content-length"]) < len(saved)
+    assert result.body == saved  # and came back decoded, byte for byte
+    # The cap is on the decoded body, as for an uncompressed one: small on the wire is not enough.
+    async with HttpxFetcher(make_settings(), max_body_bytes=len(saved) - 1) as capped:
+        over = await capped.fetch(server.url("/page/2/"))
+    assert over.error is TransportError.PROTOCOL
+    assert over.body == b""
+
+
+async def test_scripts_are_served_as_javascript(fixture_server: FixtureServer) -> None:
+    async with HttpxFetcher(make_settings()) as fetcher:
+        result = await fetcher.fetch(fixture_server.url("/static/jquery.js"))
+    assert result.status == 200
+    assert result.headers["content-type"] == "text/javascript; charset=utf-8"

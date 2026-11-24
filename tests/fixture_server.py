@@ -25,11 +25,16 @@ What it serves, in order of precedence:
    such file: the captured JavaScript page loads ``/static/jquery.js``, which was not captured, and a
    tiny stand-in there provides the one helper the page's script calls.
 
+With ``gzip=True`` every non-empty body is sent ``Content-Encoding: gzip`` to a client that
+accepts it, as real servers do, so the decoding seam (httpx decodes, the browser path strips the
+wire headers) is exercised over a real socket.
+
 Every request is logged (path, User-Agent, status, time) under a lock; :meth:`hits` counts them.
 """
 
 from __future__ import annotations
 
+import gzip as gzip_codec
 import threading
 import time
 from collections import Counter
@@ -53,7 +58,11 @@ CHALLENGE_HTML = (
     b"<body><h1>Checking your browser</h1><p>Verify you are human.</p></body></html>"
 )
 
-_TYPES = {".html": "text/html; charset=utf-8", ".txt": "text/plain; charset=utf-8"}
+_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",  # a real script type, so no browser sniffing is needed
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,11 +137,14 @@ class _Handler(BaseHTTPRequestHandler):
 class FixtureServer:
     """See the module docstring. Use :func:`start` or the ``fixture_server`` pytest fixture."""
 
-    def __init__(self, site: str = "quotes", *, robots_txt: str | None = None) -> None:
+    def __init__(
+        self, site: str = "quotes", *, robots_txt: str | None = None, gzip: bool = False
+    ) -> None:
         self.root = SITES / site
         if not self.root.is_dir():
             raise ValueError(f"no saved site {site!r} under {SITES}")
         self.robots_txt = robots_txt
+        self.gzip = gzip
         self._lock = threading.Lock()
         self._log: list[Hit] = []
         self._routes: dict[str, Phase] = {}
@@ -277,22 +289,30 @@ class FixtureServer:
         status = phase.status if phase.status is not None else 200
         with self._lock:
             self._log.append(Hit(path, request.headers.get("User-Agent"), status, time.monotonic()))
+        body = phase.body
+        headers = dict(phase.headers)
+        accepts = request.headers.get("Accept-Encoding", "").lower()
+        if self.gzip and body and "gzip" in accepts and "Content-Encoding" not in headers:
+            body = gzip_codec.compress(body, mtime=0)
+            headers["Content-Encoding"] = "gzip"
         try:
             request.send_response(status)
-            for name, value in phase.headers.items():
+            for name, value in headers.items():
                 request.send_header(name, value)
-            request.send_header("Content-Length", str(len(phase.body)))
+            request.send_header("Content-Length", str(len(body)))
             request.end_headers()
             if phase.drip_s > 0:
-                for index in range(len(phase.body)):
-                    request.wfile.write(phase.body[index : index + 1])
+                for index in range(len(body)):
+                    request.wfile.write(body[index : index + 1])
                     request.wfile.flush()
                     time.sleep(phase.drip_s)
             else:
-                request.wfile.write(phase.body)
+                request.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the client gave up (a timeout test); nothing to answer
 
 
-def start(site: str = "quotes", *, robots_txt: str | None = None) -> FixtureServer:
-    return FixtureServer(site, robots_txt=robots_txt).start()
+def start(
+    site: str = "quotes", *, robots_txt: str | None = None, gzip: bool = False
+) -> FixtureServer:
+    return FixtureServer(site, robots_txt=robots_txt, gzip=gzip).start()
