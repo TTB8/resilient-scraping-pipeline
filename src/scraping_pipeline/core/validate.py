@@ -12,7 +12,7 @@ Rules, in the order they run:
    draft field is passed as *absent*, so it is reported as rule ``missing`` rather than a type error.
 2. **Uniqueness** (``duplicate_key``) on ``book_id`` / ``quote_id`` / ``author_slug`` among the rows
    that passed the contract. Rows are first put in a canonical order (key, source URL, position,
-   content hash, then the draft's ``repr`` as a last tie-break), and the first row of each key is kept; later ones are quarantined with a pointer to
+   content hash, then the ``repr`` of draft and lineage as a last tie-break), and the first row of each key is kept; later ones are quarantined with a pointer to
    the kept row's source. The choice is therefore deterministic whatever order the stage passes rows in.
 3. **Referential**: a book's category must be in the category set discovered on the home page
    (``unknown_category``); a quote's ``author_slug`` must name a *valid* author row (``unknown_author``),
@@ -232,13 +232,13 @@ def _contract_rows[D: Draft](
         row = _Row(
             record_type=record_type,
             key=key,
-            # A total order: two rows with equal lineage but different drafts still sort the same way
+            # A total order: two rows that differ anywhere (draft or lineage) still sort the same way
             # whatever order they arrive in (found by the property test on input order).
             order=(
                 candidate.lineage.source_url,
                 position,
                 candidate.lineage.content_sha256,
-                repr(candidate.draft),
+                repr(candidate),
             ),
             candidate=candidate,
             record=None,
