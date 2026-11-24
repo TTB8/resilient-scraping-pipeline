@@ -33,7 +33,7 @@ from scraping_pipeline.fetch.fake import (
     slow,
     timeout,
 )
-from scraping_pipeline.fetch.scheduler import CrawlSummary, PoliteScheduler
+from scraping_pipeline.fetch.scheduler import CrawlSummary, PoliteScheduler, origin_of
 
 HOST = "https://quotes.example.test"
 OTHER = "https://books.example.test"
@@ -780,3 +780,46 @@ async def test_next_request_after_a_slow_429_waits_a_full_interval() -> None:
     after = [c.started_at for c in crawl.fake.calls[2:]]
     # Rate halved to 0.5/s: the next request goes 2 s after the 429, not at once.
     assert min(after) == pytest.approx(4.0 + 2.0)
+
+
+async def test_robots_redirect_loop_stops_the_domain() -> None:
+    loop = {u("/robots.txt"): redirect("/r1")} | {
+        u(f"/r{n}"): redirect(f"/r{n + 1}") for n in range(9)
+    }
+    crawl = Crawl({**loop, u("/a"): ok()})
+    summary = await crawl.run([u("/a")])
+    assert len(crawl.fake.calls) == 6  # robots.txt plus five hops, then give up
+    reason = summary.domains_stopped["quotes.example.test"]
+    assert reason == "robots.txt unreachable: redirect loop: more than 5 hops"
+
+
+async def test_robots_redirect_to_a_non_http_scheme_stops_the_domain() -> None:
+    crawl = Crawl({ROBOTS: redirect("ftp://quotes.example.test/robots.txt"), u("/a"): ok()})
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.urls_called() == [ROBOTS]
+    assert "not an http(s) URL" in summary.domains_stopped["quotes.example.test"]
+
+
+async def test_crawl_delay_over_the_limit_stops_the_domain() -> None:
+    robots = ok("User-agent: *\nCrawl-delay: 600\n", content_type="text/plain")
+    crawl = Crawl({ROBOTS: robots, u("/a"): ok()}, max_crawl_delay_s=60.0)
+    summary = await crawl.run([u("/a")])
+    assert crawl.fake.urls_called() == [ROBOTS]
+    assert (
+        "Crawl-delay 600s exceeds the 60s limit" in summary.domains_stopped["quotes.example.test"]
+    )
+    assert crawl.sink.finals()[u("/a")].status is FrontierStatus.STOPPED
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("https://Quotes.Example.test/a", ("https", "quotes.example.test", 443)),
+        ("http://quotes.example.test:8080/", ("http", "quotes.example.test", 8080)),
+        ("ftp://quotes.example.test/", None),
+        ("https:///no-host", None),
+        ("https://quotes.example.test:99999/", None),  # invalid port
+    ],
+)
+def test_origin_of(url: str, origin: tuple[str, str, int] | None) -> None:
+    assert origin_of(url) == origin
