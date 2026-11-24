@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -14,7 +15,15 @@ from fetch_support import VirtualTime
 from scraping_pipeline.config import Settings
 from scraping_pipeline.core.frontier import FrontierEntry
 from scraping_pipeline.core.types import FrontierStatus, PageKind, ResponseClass, Site
-from scraping_pipeline.fetch.fake import FakeFetcher, block_page, ok, rate_limited, server_error
+from scraping_pipeline.fetch.fake import (
+    FakeFetcher,
+    Respond,
+    block_page,
+    ok,
+    rate_limited,
+    server_error,
+)
+from scraping_pipeline.sites import SiteSpec
 from scraping_pipeline.stages import run_discover
 from scraping_pipeline.stages.fetch import FetchTiming, _Feeder, run_fetch
 from scraping_pipeline.storage.cache import PageCache
@@ -24,7 +33,13 @@ from scraping_pipeline.storage.state import (
     Stage,
     StateStore,
 )
-from stage_support import fast_fetch, saved_site_fetcher, settled_urls, stage_settings
+from stage_support import (
+    fast_fetch,
+    saved_site_fetcher,
+    settled_urls,
+    stage_settings,
+    virtual_runner,
+)
 
 HOME = "https://quotes.toscrape.com/"
 PAGE_2 = "https://quotes.toscrape.com/page/2/"
@@ -292,6 +307,145 @@ def test_retry_failed_is_opt_in_and_grants_one_more_attempt(tmp_path: Path) -> N
     healed, _ = saved_site_fetcher("quotes", {HOME: ok("<html></html>")})
     final = fast_fetch(settings, Site.QUOTES, healed, retry_failed=True)
     assert final.statuses[FrontierStatus.DONE] == 1
+
+
+# --- round 2: links on redirected pages, downgrades, breaker events, robots fetcher ---------------
+
+_NEXT_ONLY = '<html><body><ul class="pager"><li class="next"><a href="next.html">Next</a></li></ul></body></html>'
+
+
+def _planned(settings: Settings) -> set[str]:
+    with StateStore.open(settings.state_db) as store:
+        return {e.url for e in store.entries(Site.QUOTES)}
+
+
+def test_links_on_a_redirected_listing_resolve_against_where_it_ended(tmp_path: Path) -> None:
+    # S14: / redirects to /dir/new/, whose relative link next.html means /dir/new/next.html. Against
+    # the entry URL it would be /next.html, a page the site never linked.
+    settings = _discovered(tmp_path, max_depth=1)
+    factory, _ = saved_site_fetcher(
+        "quotes",
+        {
+            HOME: Respond(301, b"", {"location": "/dir/new/"}),
+            "https://quotes.toscrape.com/dir/new/": ok(_NEXT_ONLY),
+        },
+    )
+    result = fast_fetch(settings, Site.QUOTES, factory)
+    planned = _planned(settings)
+    assert "https://quotes.toscrape.com/dir/new/next.html" in planned
+    assert "https://quotes.toscrape.com/next.html" not in planned
+    assert result.scheme_downgrades == 0
+
+
+def test_links_on_a_scheme_downgraded_page_are_kept_on_the_entry_origin(tmp_path: Path) -> None:
+    # R2-08 / ADR 0010: the hop went to http on the same host. Resolved against the http URL, every
+    # link would be off-origin for the scheme-strict link rule and silently dropped.
+    settings = _discovered(tmp_path, max_depth=1)
+    factory, log = saved_site_fetcher(
+        "quotes",
+        {
+            HOME: Respond(308, b"", {"location": "http://quotes.toscrape.com/dir/new/"}),
+            "http://quotes.toscrape.com/dir/new/": ok(_NEXT_ONLY),
+        },
+    )
+    result = fast_fetch(settings, Site.QUOTES, factory)
+    planned = _planned(settings)
+    assert "https://quotes.toscrape.com/dir/new/next.html" in planned
+    assert not any(url.startswith("http://") for url in planned)
+    assert "https://quotes.toscrape.com/dir/new/next.html" in log.urls()  # and it was crawled
+    assert result.scheme_downgrades == 1
+    with StateStore.open(settings.state_db) as store:
+        run = store.get_run(result.run_id)
+    assert run is not None
+    assert run.summary_json is not None
+    assert json.loads(run.summary_json)["scheme_downgrades"] == 1
+
+
+def test_offline_expansion_keeps_links_of_a_downgraded_page(tmp_path: Path) -> None:
+    # The same rule in expand_from_cache: a frontier rebuilt next to the cache plans the same links.
+    settings = _discovered(tmp_path, max_depth=1)
+    factory, _ = saved_site_fetcher(
+        "quotes",
+        {
+            HOME: Respond(308, b"", {"location": "http://quotes.toscrape.com/dir/new/"}),
+            "http://quotes.toscrape.com/dir/new/": ok(_NEXT_ONLY),
+        },
+    )
+    fast_fetch(settings, Site.QUOTES, factory)
+    settings.state_db.unlink()
+    run_discover(settings, Site.QUOTES)  # seeds, then offline expansion from the cache
+    assert "https://quotes.toscrape.com/dir/new/next.html" in _planned(settings)
+
+
+def test_a_breaker_opening_is_recorded_as_a_domain_event(tmp_path: Path) -> None:
+    # I2-1: ADR 0008 lists the breaker among domain_events; the event must actually be written.
+    settings = _discovered(
+        tmp_path,
+        max_depth=0,
+        breaker_failure_threshold=2,
+        max_concurrency_per_domain=1,
+        max_attempts=5,
+    )
+    factory, _ = saved_site_fetcher("quotes", {HOME: [server_error(), server_error(), ok()]})
+    result = fast_fetch(settings, Site.QUOTES, factory)
+    assert result.statuses[FrontierStatus.DONE] == 1
+    with StateStore.open(settings.state_db) as store:
+        events = store.domain_events(Site.QUOTES)
+    assert [e.event for e in events] == [DomainEventKind.ROBOTS, DomainEventKind.BREAKER_OPENED]
+    opened = events[1]
+    assert (opened.domain, opened.run_id) == ("quotes.toscrape.com", result.run_id)
+    assert opened.response_class is ResponseClass.SERVER_ERROR
+    assert opened.reason
+
+
+_JS_HOME = "https://quotes.toscrape.com/js/"
+_JS_ROBOTS = "https://quotes.toscrape.com/robots.txt"
+_JS_RULES = ok("User-agent: *\nDisallow: /js/\n", content_type="text/plain")
+
+
+def test_a_browser_site_reads_robots_with_the_robots_fetcher(tmp_path: Path) -> None:
+    # R2-04: the page fetcher (the browser) is never asked for robots.txt. Had it been, its 404
+    # would allow /js/; the raw fetcher's 200 disallows it.
+    settings = stage_settings(tmp_path)
+    run_discover(settings, Site.QUOTES_JS)
+    page = FakeFetcher({_JS_HOME: ok()})
+    raw = FakeFetcher({_JS_ROBOTS: _JS_RULES})
+    runner, timing = virtual_runner()
+    result = run_fetch(
+        settings,
+        Site.QUOTES_JS,
+        fetcher_factory=lambda: page,
+        robots_fetcher_factory=lambda: raw,
+        timing=timing,
+        runner=runner,
+    )
+    assert raw.urls_called() == [_JS_ROBOTS]
+    assert page.urls_called() == []
+    assert result.statuses[FrontierStatus.SKIPPED_ROBOTS] == 1
+    assert result.requests == 1
+
+
+def test_by_default_a_site_gets_its_robots_fetcher_from_its_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = stage_settings(tmp_path)
+    run_discover(settings, Site.QUOTES_JS)
+    page = FakeFetcher({_JS_HOME: ok()})
+    raw = FakeFetcher({_JS_ROBOTS: _JS_RULES})
+    asked: list[Site] = []
+
+    def make_robots(spec: SiteSpec, _settings: Settings) -> FakeFetcher:
+        asked.append(spec.site)
+        return raw
+
+    monkeypatch.setattr(SiteSpec, "make_fetcher", lambda _spec, _settings: page)
+    monkeypatch.setattr(SiteSpec, "make_robots_fetcher", make_robots)
+    runner, timing = virtual_runner()
+    result = run_fetch(settings, Site.QUOTES_JS, timing=timing, runner=runner)
+    assert asked == [Site.QUOTES_JS]
+    assert raw.urls_called() == [_JS_ROBOTS]
+    assert page.urls_called() == []
+    assert result.statuses[FrontierStatus.SKIPPED_ROBOTS] == 1
 
 
 # --- the feeder ----------------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from scraping_pipeline.core.urls import (
     InvalidUrlError,
     canonicalize,
     domain,
+    link_base,
     normalize_percent_encoding,
     remove_dot_segments,
     resolve,
@@ -258,3 +259,24 @@ def test_canonicalize_is_idempotent_on_awkward_urls(
     raw_pairs = sorted(p for p in qs.split("&") if p)
     kept = once.partition("?")[2]
     assert sorted(p for p in kept.split("&") if p) == raw_pairs
+
+
+@pytest.mark.parametrize(
+    ("page_url", "entry_url", "base"),
+    [
+        # A same-host scheme switch on default ports: back onto the entry's origin (ADR 0010).
+        ("http://h.test/dir/new/", "https://h.test/old", "https://h.test/dir/new/"),
+        ("http://h.test:80/a?q=1", "https://h.test/a", "https://h.test/a?q=1"),
+        ("https://h.test/x/", "http://h.test/x", "http://h.test/x/"),
+        # Everything else is left alone: same origin, other host, other port.
+        ("https://h.test/dir/new/", "https://h.test/old", "https://h.test/dir/new/"),
+        ("http://other.test/a/", "https://h.test/a", "http://other.test/a/"),
+        ("http://h.test:8080/a/", "https://h.test/a", "http://h.test:8080/a/"),
+        ("http://h.test/a/", "https://h.test:8443/a", "http://h.test/a/"),
+        ("not a url", "https://h.test/a", "not a url"),
+    ],
+)
+def test_link_base_rebases_only_a_same_host_scheme_switch(
+    page_url: str, entry_url: str, base: str
+) -> None:
+    assert link_base(page_url, entry_url) == base

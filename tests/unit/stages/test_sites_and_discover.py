@@ -57,6 +57,17 @@ def test_each_site_gets_its_fetcher(tmp_path: Path) -> None:
     assert isinstance(browser, PlaywrightFetcher)
 
 
+def test_a_browser_site_reads_robots_txt_with_a_raw_http_fetcher(tmp_path: Path) -> None:
+    # R2-04: robots.txt through Chromium either times out on the selector wait or parses the text
+    # viewer's HTML as "no rules". A browser site gets an HttpxFetcher for it; others reuse theirs.
+    settings = stage_settings(tmp_path)
+    raw = get_site(Site.QUOTES_JS).make_robots_fetcher(settings)
+    assert isinstance(raw, HttpxFetcher)
+    asyncio.run(raw.aclose())
+    assert get_site(Site.BOOKS).make_robots_fetcher(settings) is None
+    assert get_site(Site.QUOTES).make_robots_fetcher(settings) is None
+
+
 def test_books_context_is_the_home_page_category_set() -> None:
     home = (SITES / "books" / "index.html").read_text(encoding="utf-8")
     context = get_site(Site.BOOKS).build_context([home])

@@ -38,6 +38,7 @@ from scraping_pipeline.core.lineage import Lineage
 from scraping_pipeline.core.parsers.base import AuthorDraft, BookDraft, Draft, QuoteDraft
 from scraping_pipeline.core.types import FrontierStatus, Site
 from scraping_pipeline.core.urls import domain as domain_of
+from scraping_pipeline.core.urls import link_base
 from scraping_pipeline.fetch.protocol import FetchResult
 from scraping_pipeline.logging import bind_run, get_logger
 from scraping_pipeline.sites import SiteSpec
@@ -321,13 +322,16 @@ def plan_links(
     """New frontier entries for the links on one page (empty unless its kind carries links).
 
     Links resolve against ``page_url`` (where redirects ended), so a redirected listing still
-    yields correct absolute URLs. Depth and page caps come from ``Settings`` via
+    yields correct absolute URLs. When the redirects only switched scheme on the same host
+    (ADR 0010), ``page_url`` is first moved back onto the entry's origin
+    (:func:`~scraping_pipeline.core.urls.link_base`), or the scheme-strict same-site rule would drop
+    every link on the page. Depth and page caps come from ``Settings`` via
     :func:`~scraping_pipeline.core.frontier.plan_new_links`, which also canonicalizes, deduplicates
     and keeps only same-site URLs.
     """
     if entry.kind not in spec.link_kinds:
         return []
-    links = spec.parse(page_url, html, entry.kind).links
+    links = spec.parse(link_base(page_url, entry.url), html, entry.kind).links
     return plan_new_links(
         known,
         links,

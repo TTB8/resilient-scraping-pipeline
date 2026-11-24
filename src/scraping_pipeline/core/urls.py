@@ -105,15 +105,42 @@ def domain(url: str) -> str:
 def same_site(url: str, origin: str) -> bool:
     """True when ``url`` has the same origin as ``origin``: scheme, host and effective port.
 
-    This is the confinement rule the frontier applies to discovered links, and it matches how the
-    scheduler confines redirects. The port counts because another port on the same host is another
-    server: it must not borrow this site's rate limit, breaker or robots.txt. Default ports are
+    This is the confinement rule the frontier applies to discovered links. It is stricter than the
+    scheduler's redirect rule, which also follows a same-host switch between ``http`` and ``https``
+    on default ports (ADR 0010); links found on a page reached that way are rebased with
+    :func:`link_base` first, so they are not dropped. The port counts because another port on the
+    same host is another server: it must not borrow this site's rate limit, breaker or robots.txt.
+    Default ports are
     normalized (``https://h/`` and ``https://h:443/`` are one origin; ``https://h:8443/`` is not),
     hosts compare case-insensitively and IDNA-encoded, and an unparseable or host-less URL is never
     same-site (fail closed).
     """
     a, b = _origin(url), _origin(origin)
     return a is not None and a == b
+
+
+def link_base(page_url: str, entry_url: str) -> str:
+    """The URL to resolve a page's links against: ``page_url``, or its twin on the entry's origin.
+
+    ``page_url`` is where the fetch ended (the last redirect hop) and ``entry_url`` is what was
+    requested. When the hops only switched between ``http`` and ``https`` on the same host, both on
+    default ports (the one cross-origin hop the scheduler follows, ADR 0010), the page belongs to
+    the entry's site: its links are resolved against the same path on the entry's scheme, or
+    :func:`same_site` would drop every one of them. Any other ``page_url`` is returned unchanged.
+    """
+    page, home = _origin(page_url), _origin(entry_url)
+    if page is None or home is None or page == home:
+        return page_url
+    (scheme, host, port), (home_scheme, home_host, home_port) = page, home
+    if (
+        host != home_host
+        or scheme == home_scheme
+        or port != _DEFAULT_PORTS.get(scheme)
+        or home_port != _DEFAULT_PORTS.get(home_scheme)
+    ):
+        return page_url
+    parts = urlsplit(page_url.strip())
+    return urlunsplit((home_scheme, urlsplit(entry_url.strip()).netloc, *parts[2:]))
 
 
 def _origin(url: str) -> tuple[str, str, int | None] | None:
